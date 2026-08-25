@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
@@ -11,12 +12,9 @@
     "cors": "^2.8.5",
     "express": "^4.22.2",
     "nanoid": "^5.0.7",
-    "socket.io": "^4.8.3",
-    "socket.io-client": "^4.8.3",
     "ws": "^8.21.3"
   },
-  "description": "",
-  "main": "test-flow.js",
+  "description": "Royalle Poker — servidor multiplayer real",
   "keywords": [],
   "author": "",
   "license": "ISC"
