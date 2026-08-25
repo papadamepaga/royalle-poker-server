@@ -105,9 +105,10 @@ function activeInHand(players) { return players.filter((p) => p.inHand && !p.fol
 function needMoreAction(players) { return players.filter((p) => p.inHand && !p.folded && !p.allIn).length > 1; }
 
 export class PokerTable {
-  constructor({ smallBlind = 25, bigBlind = 50 } = {}) {
+  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0 } = {}) {
     this.smallBlind = smallBlind;
     this.bigBlind = bigBlind;
+    this.rakePercent = rakePercent; // e.g. 5 means 5% of each pot
     this.players = []; // { id, name, chips, cards, folded, allIn, inHand, roundBet, totalBet, connected }
     this.deck = [];
     this.community = [];
@@ -120,6 +121,7 @@ export class PokerTable {
     this.log = [];
     this.results = {};
     this.toActQueue = [];
+    this.pendingRake = 0; // chips raked in the most recently completed hand, not yet recorded by the caller
   }
 
   addLog(msg) {
@@ -260,7 +262,14 @@ export class PokerTable {
         this.actingId = this.toActQueue[0] ?? null;
       } else {
         this.actingId = null;
-        // auto-runout: caller (index.js) should re-invoke advanceStage after a short delay
+        if (this.stage === "river") {
+          // No more betting possible (everyone left is all-in) and we
+          // just dealt the last card — go straight to showdown instead
+          // of waiting for another auto-runout tick that will never come.
+          this.resolveShowdownOrFold();
+        }
+        // otherwise: caller (index.js) re-invokes advanceStage after a
+        // short delay to deal the next street automatically.
       }
     } else if (this.stage === "river") {
       this.resolveShowdownOrFold();
@@ -270,6 +279,7 @@ export class PokerTable {
   resolveShowdownOrFold() {
     const contenders = activeInHand(this.players);
     const tags = {};
+    this.pendingRake = 0;
     if (contenders.length === 1) {
       const winner = contenders[0];
       const totalPot = this.players.reduce((s, p) => s + p.totalBet, 0);
@@ -287,8 +297,14 @@ export class PokerTable {
           if (!bestScore || compareScores(s, bestScore) > 0) { bestScore = s; winners = [id]; }
           else if (compareScores(s, bestScore) === 0) winners.push(id);
         });
-        const share = Math.floor(potObj.amount / winners.length);
-        let remainder = potObj.amount - share * winners.length;
+        // Standard "rake the pot" convention: only pots that reach a real
+        // showdown (not everyone-folds-preflop) get raked, and the rake
+        // is taken off the top before splitting among winners.
+        const rakeAmount = this.rakePercent > 0 ? Math.floor((potObj.amount * this.rakePercent) / 100) : 0;
+        const distributable = potObj.amount - rakeAmount;
+        this.pendingRake += rakeAmount;
+        const share = Math.floor(distributable / winners.length);
+        let remainder = distributable - share * winners.length;
         winners.forEach((id) => {
           const pl = this.players.find((p) => p.id === id);
           let amt = share; if (remainder > 0) { amt += 1; remainder -= 1; }
@@ -297,7 +313,8 @@ export class PokerTable {
         });
         const label = pots.length > 1 ? (idx === 0 ? "Pote principal" : `Side pot ${idx}`) : "Pote";
         const names = winners.map((id) => this.players.find((p) => p.id === id).name).join(", ");
-        this.addLog(`${label} (${potObj.amount}): ${names} vence com ${CATEGORY_NAMES[bestScore.category]}.`);
+        const rakeNote = rakeAmount > 0 ? ` (rake: ${rakeAmount})` : "";
+        this.addLog(`${label} (${potObj.amount}${rakeNote}): ${names} vence com ${CATEGORY_NAMES[bestScore.category]}.`);
       });
     }
     this.results = tags;

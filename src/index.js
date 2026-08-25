@@ -4,6 +4,13 @@ import { WebSocketServer } from "ws";
 import cors from "cors";
 import { customAlphabet } from "nanoid";
 import { PokerTable } from "./pokerEngine.js";
+import { migrate } from "./db.js";
+import { hashPassword, verifyPassword, signToken, verifyToken } from "./auth.js";
+import {
+  AVATAR_OPTIONS, createUser, findUserByUsername, findUserById,
+  createClub, getClubByCode, addMember, getMember, listMembers,
+  adjustMemberChips, recordRake, getWeeklyRake,
+} from "./store.js";
 
 const PORT = process.env.PORT || 3001;
 const makeCode = customAlphabet("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", 6);
@@ -15,148 +22,236 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
 
-// ---- In-memory store -------------------------------------------------
-// IMPORTANT: this resets whenever the server restarts. It's fine for
-// testing with friends, but a real launch needs a real database
-// (Postgres, etc.) so clubs and chip balances survive restarts/deploys.
-const clubs = new Map(); // code -> { name, ownerName, members: Map(name -> {chips, role}), table, sockets: Set, socketToPlayer: Map }
+// ---- Runtime (in-memory, per-club live state) -------------------------
+// Persistent stuff (users, club metadata, chip balances) lives in
+// Postgres via store.js. This map only holds what's inherently transient:
+// the live PokerTable instance and which sockets are currently watching
+// or seated at a given club.
+const runtime = new Map(); // code -> { clubId, sockets: Set<ws>, socketToPlayer: Map<ws, username>, table: PokerTable|null }
 
-function ensureTable(club) {
-  if (!club.table) club.table = new PokerTable({ smallBlind: 25, bigBlind: 50 });
-  return club.table;
+function ensureRuntime(code, clubId) {
+  if (!runtime.has(code)) runtime.set(code, { clubId, sockets: new Set(), socketToPlayer: new Map(), table: null });
+  return runtime.get(code);
 }
 
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function clubMembersPayload(club) {
-  return [...club.members.entries()].map(([name, m]) => ({ name, ...m }));
+async function broadcastClub(code) {
+  const rt = runtime.get(code);
+  if (!rt) return;
+  const club = await getClubByCode(code);
+  const members = await listMembers(rt.clubId);
+  const payload = { type: "club_state", club: publicClub(club), members };
+  for (const ws of rt.sockets) send(ws, payload);
 }
 
-function broadcastClub(club) {
-  const payload = { type: "club_state", name: club.name, members: clubMembersPayload(club) };
-  for (const ws of club.sockets) send(ws, payload);
-}
-
-function broadcastTable(club) {
-  const table = club.table;
+function broadcastTable(code) {
+  const rt = runtime.get(code);
+  const table = rt?.table;
   if (!table) return;
-  for (const [ws, playerId] of club.socketToPlayer.entries()) {
-    send(ws, { type: "table_state", state: table.getPublicState(playerId) });
+  for (const [ws, username] of rt.socketToPlayer.entries()) {
+    send(ws, { type: "table_state", state: table.getPublicState(username) });
   }
+  maybeRecordRake(rt);
   if (table.needsAutoRunout()) {
     setTimeout(() => {
-      if (club.table !== table) return; // table was replaced/reset
+      if (rt.table !== table) return;
       table.advanceStage();
-      broadcastTable(club);
+      broadcastTable(code);
     }, 900);
   }
 }
 
-// Handles one parsed message. `ctx.setJoinedCode` lets us remember, on the
-// connection closure, which club this socket belongs to (for cleanup).
-function handleMessage(ws, msg, ctx) {
-  const { type, reply, setJoinedCode } = { ...msg, reply: ctx.reply, setJoinedCode: ctx.setJoinedCode };
+async function maybeRecordRake(rt) {
+  if (rt.table?.pendingRake > 0) {
+    const amount = rt.table.pendingRake;
+    rt.table.pendingRake = 0;
+    await recordRake(rt.clubId, amount);
+  }
+}
+
+function publicClub(club) {
+  if (!club) return null;
+  return {
+    code: club.code,
+    name: club.name,
+    smallBlind: club.small_blind,
+    bigBlind: club.big_blind,
+    buyIn: club.buy_in,
+    rakePercent: Number(club.rake_percent),
+    ownerId: club.owner_id,
+  };
+}
+
+function requireAuth(ws, ctx) {
+  if (!ws.userId) { ctx.reply({ ok: false, error: "Faça login primeiro." }); return false; }
+  return true;
+}
+
+async function handleMessage(ws, msg, ctx) {
+  const { type } = msg;
+
+  if (type === "signup") {
+    const username = (msg.username || "").trim();
+    const password = msg.password || "";
+    const avatar = AVATAR_OPTIONS.includes(msg.avatar) ? msg.avatar : AVATAR_OPTIONS[0];
+    if (username.length < 3) return ctx.reply({ ok: false, error: "Usuário precisa ter pelo menos 3 letras." });
+    if (password.length < 4) return ctx.reply({ ok: false, error: "Senha precisa ter pelo menos 4 caracteres." });
+    const existing = await findUserByUsername(username);
+    if (existing) return ctx.reply({ ok: false, error: "Esse nome de usuário já existe." });
+    const hash = await hashPassword(password);
+    const user = await createUser(username, hash, avatar);
+    if (!user) return ctx.reply({ ok: false, error: "Não deu pra criar a conta." });
+    ws.userId = user.id; ws.username = user.username;
+    const token = signToken(user.id, user.username);
+    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar } });
+    return;
+  }
+
+  if (type === "login") {
+    const username = (msg.username || "").trim();
+    const user = await findUserByUsername(username);
+    if (!user) return ctx.reply({ ok: false, error: "Usuário ou senha incorretos." });
+    const valid = await verifyPassword(msg.password || "", user.password_hash);
+    if (!valid) return ctx.reply({ ok: false, error: "Usuário ou senha incorretos." });
+    ws.userId = user.id; ws.username = user.username;
+    const token = signToken(user.id, user.username);
+    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar } });
+    return;
+  }
+
+  if (type === "authenticate") {
+    const payload = verifyToken(msg.token || "");
+    if (!payload) return ctx.reply({ ok: false, error: "Sessão expirada, faça login de novo." });
+    const user = await findUserById(payload.sub);
+    if (!user) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
+    ws.userId = user.id; ws.username = user.username;
+    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar } });
+    return;
+  }
 
   if (type === "create_club") {
+    if (!requireAuth(ws, ctx)) return;
     const code = makeCode();
-    const club = {
+    const club = await createClub({
+      code,
       name: msg.clubName,
-      ownerName: msg.ownerName,
-      members: new Map([[msg.ownerName, { chips: 20000, role: "owner" }]]),
-      table: null,
-      sockets: new Set(),
-      socketToPlayer: new Map(),
-    };
-    clubs.set(code, club);
-    club.sockets.add(ws);
-    setJoinedCode(code);
+      ownerId: ws.userId,
+      smallBlind: msg.smallBlind || 25,
+      bigBlind: msg.bigBlind || 50,
+      buyIn: msg.buyIn || 5000,
+      rakePercent: msg.rakePercent ?? 5,
+    });
+    await addMember(club.id, ws.userId, 20000, "owner");
+    const rt = ensureRuntime(code, club.id);
+    rt.sockets.add(ws);
+    ctx.setJoinedCode(code);
     ctx.reply({ ok: true, code });
     return;
   }
 
   if (type === "join_club") {
-    const club = clubs.get(msg.code);
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Código não encontrado." });
-    if (!club.members.has(msg.playerName)) club.members.set(msg.playerName, { chips: 5000, role: "member" });
-    club.sockets.add(ws);
-    setJoinedCode(msg.code);
-    ctx.reply({ ok: true, clubName: club.name });
-    broadcastClub(club);
+    const existing = await getMember(club.id, ws.userId);
+    if (!existing) await addMember(club.id, ws.userId, 5000, "member");
+    const rt = ensureRuntime(club.code, club.id);
+    rt.sockets.add(ws);
+    ctx.setJoinedCode(club.code);
+    ctx.reply({ ok: true, code: club.code, clubName: club.name });
+    await broadcastClub(club.code);
     return;
   }
 
   if (type === "get_club_state") {
-    const club = clubs.get(msg.code);
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
-    club.sockets.add(ws);
-    setJoinedCode(msg.code);
-    ctx.reply({ ok: true, name: club.name, members: clubMembersPayload(club) });
-    if (club.table) send(ws, { type: "table_state", state: club.table.getPublicState(null) });
+    const members = await listMembers(club.id);
+    const rt = ensureRuntime(club.code, club.id);
+    rt.sockets.add(ws);
+    ctx.setJoinedCode(club.code);
+    const weeklyRake = await getWeeklyRake(club.id);
+    ctx.reply({ ok: true, club: publicClub(club), members, weeklyRake });
+    if (rt.table) send(ws, { type: "table_state", state: rt.table.getPublicState(ws.username) });
     return;
   }
 
   if (type === "adjust_chips") {
-    const club = clubs.get(msg.code);
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false });
-    const m = club.members.get(msg.targetName);
-    if (!m) return ctx.reply({ ok: false });
-    m.chips = Math.max(0, m.chips + msg.delta);
-    ctx.reply({ ok: true, chips: m.chips });
-    broadcastClub(club);
+    const me = await getMember(club.id, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
+    const target = await findUserByUsername(msg.targetUsername);
+    if (!target) return ctx.reply({ ok: false, error: "Jogador não encontrado." });
+    const chips = await adjustMemberChips(club.id, target.id, msg.delta);
+    ctx.reply({ ok: true, chips });
+    await broadcastClub(club.code);
     return;
   }
 
   if (type === "sit_table") {
-    const club = clubs.get(msg.code);
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
-    const member = club.members.get(msg.playerName);
+    const member = await getMember(club.id, ws.userId);
     if (!member || member.chips < msg.buyIn) return ctx.reply({ ok: false, error: "Fichas insuficientes." });
-    member.chips -= msg.buyIn;
-    const table = ensureTable(club);
-    table.addPlayer(msg.playerName, msg.playerName, msg.buyIn);
-    club.socketToPlayer.set(ws, msg.playerName);
+    await adjustMemberChips(club.id, ws.userId, -msg.buyIn);
+    const rt = ensureRuntime(club.code, club.id);
+    if (!rt.table) rt.table = new PokerTable({ smallBlind: club.small_blind, bigBlind: club.big_blind, rakePercent: Number(club.rake_percent) });
+    rt.table.addPlayer(ws.username, ws.username, msg.buyIn);
+    rt.socketToPlayer.set(ws, ws.username);
     ctx.reply({ ok: true });
-    broadcastClub(club);
-    broadcastTable(club);
+    await broadcastClub(club.code);
+    broadcastTable(club.code);
     return;
   }
 
   if (type === "start_hand") {
-    const club = clubs.get(msg.code);
-    if (!club?.table) return ctx.reply({ ok: false });
-    club.table.startHand();
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false });
+    rt.table.startHand();
     ctx.reply({ ok: true });
-    broadcastTable(club);
+    broadcastTable(code);
     return;
   }
 
   if (type === "player_action") {
-    const club = clubs.get(msg.code);
-    if (!club?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
-    const playerId = club.socketToPlayer.get(ws);
-    if (!playerId) return ctx.reply({ ok: false, error: "Você não está sentado." });
-    const result = club.table.applyAction(playerId, msg.action, msg.amount);
-    broadcastTable(club);
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const username = rt.socketToPlayer.get(ws);
+    if (!username) return ctx.reply({ ok: false, error: "Você não está sentado." });
+    const result = rt.table.applyAction(username, msg.action, msg.amount);
+    broadcastTable(code);
     ctx.reply(result?.error ? { ok: false, error: result.error } : { ok: true });
     return;
   }
 
   if (type === "leave_table") {
-    const club = clubs.get(msg.code);
-    if (!club?.table) return ctx.reply({ ok: true });
-    const playerName = club.socketToPlayer.get(ws);
-    const player = club.table.players.find((p) => p.id === playerName);
-    if (player) {
-      const member = club.members.get(playerName);
-      if (member) member.chips += player.chips;
-      club.table.removePlayer(playerName);
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: true });
+    const username = rt.socketToPlayer.get(ws);
+    const player = rt.table.players.find((p) => p.id === username);
+    const club = await getClubByCode(code);
+    let chips = 0;
+    if (player && club) {
+      chips = await adjustMemberChips(club.id, ws.userId, player.chips);
+      rt.table.removePlayer(username);
     }
-    club.socketToPlayer.delete(ws);
-    ctx.reply({ ok: true, chips: club.members.get(playerName)?.chips ?? 0 });
-    broadcastClub(club);
-    broadcastTable(club);
+    rt.socketToPlayer.delete(ws);
+    ctx.reply({ ok: true, chips });
+    await broadcastClub(code);
+    broadcastTable(code);
     return;
   }
 
@@ -168,7 +263,7 @@ wss.on("connection", (ws) => {
   console.log("Nova conexão WebSocket recebida.");
   let joinedCode = null;
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -180,7 +275,7 @@ wss.on("connection", (ws) => {
     const reply = (data) => send(ws, { type: "ack", reqId: msg.reqId, ...data });
 
     try {
-      handleMessage(ws, msg, { reply, setJoinedCode: (c) => { joinedCode = c; } });
+      await handleMessage(ws, msg, { reply, setJoinedCode: (c) => { joinedCode = c; } });
     } catch (err) {
       console.error("Erro processando mensagem", msg.type, err);
       reply({ ok: false, error: "Erro interno no servidor." });
@@ -190,16 +285,16 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     console.log("Conexão WebSocket fechada.");
     if (!joinedCode) return;
-    const club = clubs.get(joinedCode);
-    if (!club) return;
-    const playerId = club.socketToPlayer.get(ws);
-    if (playerId && club.table) {
-      const p = club.table.players.find((pl) => pl.id === playerId);
+    const rt = runtime.get(joinedCode);
+    if (!rt) return;
+    const username = rt.socketToPlayer.get(ws);
+    if (username && rt.table) {
+      const p = rt.table.players.find((pl) => pl.id === username);
       if (p) p.connected = false;
-      broadcastTable(club);
+      broadcastTable(joinedCode);
     }
-    club.sockets.delete(ws);
-    club.socketToPlayer.delete(ws);
+    rt.sockets.delete(ws);
+    rt.socketToPlayer.delete(ws);
   });
 
   ws.on("error", (err) => {
@@ -207,6 +302,13 @@ wss.on("connection", (ws) => {
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`Royalle Poker server rodando na porta ${PORT}`);
-});
+migrate()
+  .then(() => {
+    httpServer.listen(PORT, () => {
+      console.log(`Royalle Poker server rodando na porta ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Falha ao migrar banco de dados:", err);
+    process.exit(1);
+  });
