@@ -15,9 +15,47 @@ const mem = {
   clubs: [], // {id, code, name, owner_id, small_blind, big_blind, buy_in, rake_percent}
   members: [], // {club_id, user_id, chips, role}
   rake: [], // {club_id, amount, created_at}
+  quickWallets: [], // {user_id, chips}
   nextUserId: 1,
   nextClubId: 1,
 };
+
+const QUICK_WALLET_START = 20000;
+
+// Carteira avulsa usada só pelas mesas públicas de "Jogar" (matchmaking por
+// tipo de jogo, fora de qualquer clube). Totalmente separada do saldo de
+// fichas de clube.
+export async function getOrCreateQuickWallet(userId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO quick_wallets (user_id, chips) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO NOTHING RETURNING chips`,
+      [userId, QUICK_WALLET_START]
+    );
+    if (rows[0]) return rows[0].chips;
+    const existing = await pool.query("SELECT chips FROM quick_wallets WHERE user_id = $1", [userId]);
+    return existing.rows[0]?.chips ?? QUICK_WALLET_START;
+  }
+  let w = mem.quickWallets.find((w) => w.user_id === userId);
+  if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START }; mem.quickWallets.push(w); }
+  return w.chips;
+}
+
+export async function adjustQuickWalletChips(userId, delta) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO quick_wallets (user_id, chips) VALUES ($1, GREATEST($2 + $3, 0))
+       ON CONFLICT (user_id) DO UPDATE SET chips = GREATEST(quick_wallets.chips + $3, 0)
+       RETURNING chips`,
+      [userId, QUICK_WALLET_START, delta]
+    );
+    return rows[0].chips;
+  }
+  let w = mem.quickWallets.find((w) => w.user_id === userId);
+  if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START }; mem.quickWallets.push(w); }
+  w.chips = Math.max(0, w.chips + delta);
+  return w.chips;
+}
 
 export async function createUser(username, passwordHash, avatar) {
   if (hasDatabase) {

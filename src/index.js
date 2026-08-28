@@ -10,10 +10,24 @@ import {
   AVATAR_OPTIONS, createUser, findUserByUsername, findUserById,
   createClub, getClubByCode, addMember, getMember, listMembers,
   adjustMemberChips, recordRake, getWeeklyRake,
+  getOrCreateQuickWallet, adjustQuickWalletChips,
 } from "./store.js";
+import { MAX_SEATS, makeBotId, pickBotName, pickBotAction } from "./bots.js";
 
 const PORT = process.env.PORT || 3001;
 const makeCode = customAlphabet("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", 6);
+const makeQuickCode = customAlphabet("0123456789", 8);
+
+// Mesas públicas de "Jogar" (fora de clube) — matchmaking automático por
+// tipo de jogo. Só Hold'em está habilitado por enquanto; PLO4/5/6 usam o
+// mesmo motor mas com regras de mão/aposta que ainda não implementamos,
+// então ficam de fora do matchmaking até essa etapa ser feita.
+const QUICK_VARIANTS = {
+  holdem: { label: "Texas Hold'em", smallBlind: 25, bigBlind: 50, buyIn: 5000, enabled: true },
+  plo4: { label: "4-Card PLO", smallBlind: 25, bigBlind: 50, buyIn: 5000, enabled: false },
+  plo5: { label: "5-Card PLO", smallBlind: 25, bigBlind: 50, buyIn: 5000, enabled: false },
+  plo6: { label: "6-Card PLO", smallBlind: 25, bigBlind: 50, buyIn: 5000, enabled: false },
+};
 
 const app = express();
 app.use(cors());
@@ -32,6 +46,87 @@ const runtime = new Map(); // code -> { clubId, sockets: Set<ws>, socketToPlayer
 function ensureRuntime(code, clubId) {
   if (!runtime.has(code)) runtime.set(code, { clubId, sockets: new Set(), socketToPlayer: new Map(), table: null });
   return runtime.get(code);
+}
+
+function ensureQuickRuntime(code, variant) {
+  if (!runtime.has(code)) {
+    runtime.set(code, { clubId: null, isQuick: true, variant, sockets: new Set(), socketToPlayer: new Map(), table: null });
+  }
+  return runtime.get(code);
+}
+
+// Acha uma mesa pública dessa variante com vaga (de verdade vazia, ou
+// ocupada por um bot que pode ser trocado por um jogador real). Prioriza
+// mesas que já estão rolando em vez de criar uma nova.
+function findOpenQuickTable(variant) {
+  let botFallback = null;
+  for (const [code, rt] of runtime.entries()) {
+    if (!rt.isQuick || rt.variant !== variant || !rt.table) continue;
+    const seated = rt.table.players.length;
+    if (seated < MAX_SEATS) return { code, rt, botIdToReplace: null };
+    const bot = rt.table.players.find((p) => p.isBot);
+    if (bot && !botFallback) botFallback = { code, rt, botIdToReplace: bot.id };
+  }
+  return botFallback;
+}
+
+function fillWithBots(table, upTo = MAX_SEATS) {
+  const names = table.players.map((p) => p.name);
+  while (table.players.length < upTo) {
+    const name = pickBotName(names);
+    names.push(name);
+    table.addPlayer(makeBotId(), name, table.bigBlind * 100, true);
+  }
+}
+
+// Mantém a mesa viva sozinha: inicia a próxima mão automaticamente e faz
+// os bots jogarem a vez deles, sem precisar de nenhum clique do jogador.
+// Só se aplica a mesas públicas (isQuick) — mesas de clube continuam
+// exatamente como estavam, com o botão manual de "iniciar mão".
+function pulseQuickTable(code) {
+  const rt = runtime.get(code);
+  if (!rt || !rt.isQuick || !rt.table) return;
+  const table = rt.table;
+
+  if (table.stage === "idle") {
+    const funded = table.players.filter((p) => p.chips > 0).length;
+    if (funded >= 2) {
+      setTimeout(() => {
+        if (runtime.get(code)?.table !== table || table.stage !== "idle") return;
+        table.startHand();
+        broadcastTable(code);
+      }, 1200);
+    }
+    return;
+  }
+
+  if (table.stage === "showdown") {
+    setTimeout(() => {
+      if (runtime.get(code)?.table !== table || table.stage !== "showdown") return;
+      // Some embora quem ficou sem fichas e sem jogadores reais restando —
+      // evita mesa de bots jogando sozinha pra sempre depois que todo
+      // mundo saiu.
+      const hasReal = table.players.some((p) => !p.isBot);
+      if (!hasReal) { runtime.delete(code); return; }
+      table.players = table.players.filter((p) => p.chips > 0 || !p.isBot);
+      if (table.players.filter((p) => p.chips > 0).length < 2) fillWithBots(table);
+      table.startHand();
+      broadcastTable(code);
+    }, 4000);
+    return;
+  }
+
+  const actingBot = table.players.find((p) => p.id === table.actingId && p.isBot);
+  if (actingBot && rt._scheduledBotFor !== actingBot.id) {
+    rt._scheduledBotFor = actingBot.id;
+    setTimeout(() => {
+      rt._scheduledBotFor = null;
+      if (runtime.get(code)?.table !== table || table.actingId !== actingBot.id) return;
+      const decision = pickBotAction(table, actingBot.id);
+      table.applyAction(actingBot.id, decision.action, decision.amount);
+      broadcastTable(code);
+    }, 700 + Math.random() * 900);
+  }
 }
 
 function send(ws, msg) {
@@ -62,6 +157,7 @@ function broadcastTable(code) {
       broadcastTable(code);
     }, 900);
   }
+  if (rt.isQuick) pulseQuickTable(code);
 }
 
 async function maybeRecordRake(rt) {
@@ -216,8 +312,41 @@ async function handleMessage(ws, msg, ctx) {
     const code = (msg.code || "").toUpperCase();
     const rt = runtime.get(code);
     if (!rt?.table) return ctx.reply({ ok: false });
+    if (rt.table.stage !== "idle") return ctx.reply({ ok: false, error: "Já tem uma mão em andamento." });
     rt.table.startHand();
     ctx.reply({ ok: true });
+    broadcastTable(code);
+    return;
+  }
+
+  if (type === "find_table") {
+    if (!requireAuth(ws, ctx)) return;
+    const variant = msg.variant;
+    const cfg = QUICK_VARIANTS[variant];
+    if (!cfg) return ctx.reply({ ok: false, error: "Tipo de jogo inválido." });
+    if (!cfg.enabled) return ctx.reply({ ok: false, error: "Esse formato chega em breve." });
+
+    const walletChips = await getOrCreateQuickWallet(ws.userId);
+    if (walletChips < cfg.buyIn) return ctx.reply({ ok: false, error: "Fichas insuficientes na carteira de jogo rápido." });
+
+    let found = findOpenQuickTable(variant);
+    let code, rt;
+    if (found) {
+      ({ code, rt } = found);
+      if (found.botIdToReplace) rt.table.removePlayer(found.botIdToReplace);
+    } else {
+      code = makeQuickCode();
+      rt = ensureQuickRuntime(code, variant);
+      rt.table = new PokerTable({ smallBlind: cfg.smallBlind, bigBlind: cfg.bigBlind, rakePercent: 0, variant });
+    }
+
+    await adjustQuickWalletChips(ws.userId, -cfg.buyIn);
+    rt.table.addPlayer(ws.username, ws.username, cfg.buyIn, false);
+    if (!found) fillWithBots(rt.table);
+    rt.sockets.add(ws);
+    rt.socketToPlayer.set(ws, ws.username);
+    ctx.setJoinedCode(code);
+    ctx.reply({ ok: true, code, variant });
     broadcastTable(code);
     return;
   }
@@ -242,6 +371,22 @@ async function handleMessage(ws, msg, ctx) {
     if (!rt?.table) return ctx.reply({ ok: true });
     const username = rt.socketToPlayer.get(ws);
     const player = rt.table.players.find((p) => p.id === username);
+
+    if (rt.isQuick) {
+      let chips = 0;
+      if (player) {
+        chips = await adjustQuickWalletChips(ws.userId, player.chips);
+        rt.table.removePlayer(username);
+      }
+      rt.socketToPlayer.delete(ws);
+      rt.sockets.delete(ws);
+      const stillReal = rt.table.players.some((p) => !p.isBot);
+      if (!stillReal) runtime.delete(code);
+      ctx.reply({ ok: true, chips });
+      if (runtime.has(code)) broadcastTable(code);
+      return;
+    }
+
     const club = await getClubByCode(code);
     let chips = 0;
     if (player && club) {

@@ -60,5 +60,14 @@ export async function migrate() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Carteira avulsa para as mesas públicas de "Jogar" (fora de clube),
+  // separada do saldo de fichas de cada clube.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS quick_wallets (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      chips BIGINT NOT NULL DEFAULT 20000,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
   console.log("Banco de dados migrado com sucesso.");
 }

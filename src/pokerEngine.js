@@ -105,11 +105,12 @@ function activeInHand(players) { return players.filter((p) => p.inHand && !p.fol
 function needMoreAction(players) { return players.filter((p) => p.inHand && !p.folded && !p.allIn).length > 1; }
 
 export class PokerTable {
-  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0 } = {}) {
+  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0, variant = "holdem" } = {}) {
     this.smallBlind = smallBlind;
     this.bigBlind = bigBlind;
     this.rakePercent = rakePercent; // e.g. 5 means 5% of each pot
-    this.players = []; // { id, name, chips, cards, folded, allIn, inHand, roundBet, totalBet, connected }
+    this.variant = variant; // "holdem" | "plo4" | "plo5" | "plo6" (só holdem implementado por enquanto)
+    this.players = []; // { id, name, chips, cards, folded, allIn, inHand, roundBet, totalBet, connected, isBot }
     this.deck = [];
     this.community = [];
     this.stage = "idle"; // idle | preflop | flop | turn | river | showdown
@@ -129,9 +130,9 @@ export class PokerTable {
     if (this.log.length > 30) this.log.shift();
   }
 
-  addPlayer(id, name, chips) {
+  addPlayer(id, name, chips, isBot = false) {
     if (this.players.find((p) => p.id === id)) return;
-    this.players.push({ id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true });
+    this.players.push({ id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot });
   }
 
   removePlayer(id) {
@@ -341,6 +342,7 @@ export class PokerTable {
       log: this.log,
       smallBlind: this.smallBlind,
       bigBlind: this.bigBlind,
+      variant: this.variant,
       players: this.players.map((p) => ({
         id: p.id,
         name: p.name,
@@ -350,6 +352,7 @@ export class PokerTable {
         roundBet: p.roundBet,
         inHand: p.inHand,
         connected: p.connected,
+        isBot: !!p.isBot,
         cards:
           p.id === forPlayerId || this.stage === "showdown" && !p.folded
             ? p.cards
