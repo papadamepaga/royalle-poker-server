@@ -1,0 +1,394 @@
+import pg from "pg";
+
+const { Pool } = pg;
+
+// Render's Postgres add-on injects DATABASE_URL automatically once the
+// database is linked to this web service. Locally, set it in a .env or
+// export it before running `npm start` if you want to test against a
+// real database; otherwise the server falls back to an in-memory store
+// (see memoryStore.js) so local development still works without Postgres.
+const connectionString = process.env.DATABASE_URL;
+
+export const hasDatabase = Boolean(connectionString);
+
+export const pool = hasDatabase
+  ? new Pool({ connectionString, ssl: connectionString.includes("render.com") ? { rejectUnauthorized: false } : false })
+  : null;
+
+export async function migrate() {
+  if (!hasDatabase) {
+    console.log("Sem DATABASE_URL configurada — rodando com armazenamento em memória (dados não persistem).");
+    return;
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      avatar TEXT NOT NULL DEFAULT 'avatar_01',
+      last_seen TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
+  // Foto de perfil enviada pelo próprio jogador (base64), opcional — quando
+  // presente, tem prioridade sobre o avatar de emoji pré-definido (avatar).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_image TEXT;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS clubs (
+      id SERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      owner_id INTEGER NOT NULL REFERENCES users(id),
+      small_blind INTEGER NOT NULL DEFAULT 25,
+      big_blind INTEGER NOT NULL DEFAULT 50,
+      buy_in INTEGER NOT NULL DEFAULT 5000,
+      rake_percent NUMERIC NOT NULL DEFAULT 5,
+      treasury_chips BIGINT NOT NULL DEFAULT 10000,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS treasury_chips BIGINT NOT NULL DEFAULT 1000;`);
+  await pool.query(`ALTER TABLE clubs ALTER COLUMN treasury_chips SET DEFAULT 10000;`);
+  // Foto/logo do clube, enviada pelo dono (base64), opcional — quando
+  // ausente, o app mostra o ícone de coroa padrão no lugar.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS image TEXT;`);
+  // Imagem de capa do cabeçalho do clube (estilo "capa" do Facebook/
+  // PPPoker) — separada do logo (image). Pode ser um preset (o próprio
+  // app já embute os presets como constantes) ou uma foto enviada pelo
+  // dono do dispositivo.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS cover_image TEXT;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_members (
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      chips BIGINT NOT NULL DEFAULT 0,
+      role TEXT NOT NULL DEFAULT 'member',
+      nickname TEXT,
+      note TEXT,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (club_id, user_id)
+    );
+  `);
+  await pool.query(`ALTER TABLE club_members ADD COLUMN IF NOT EXISTS nickname TEXT;`);
+  await pool.query(`ALTER TABLE club_members ADD COLUMN IF NOT EXISTS note TEXT;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rake_ledger (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      amount NUMERIC NOT NULL,
+      platform_amount NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // "amount" é a parte do CLUBE (ex: 4% do pote); "platform_amount" é a
+  // parte do APP (ex: 1% do pote) — gravadas juntas, na mesma mão.
+  await pool.query(`ALTER TABLE rake_ledger ADD COLUMN IF NOT EXISTS platform_amount NUMERIC NOT NULL DEFAULT 0;`);
+  // Carteira avulsa para as mesas públicas de "Jogar" (fora de clube),
+  // separada do saldo de fichas de cada clube. Essa é a "Royalle Coin".
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS quick_wallets (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      chips BIGINT NOT NULL DEFAULT 10000,
+      last_daily_claim DATE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS last_daily_claim DATE;`);
+  await pool.query(`ALTER TABLE quick_wallets ALTER COLUMN chips SET DEFAULT 10000;`);
+  // "Gemas" — segunda moeda (mostrada como diamante no header), separada
+  // da Royalle Coin. Hoje só é acumulada por fontes futuras (loja, VIP);
+  // começa zerada e é só exibida/consultada por enquanto.
+  await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS gems BIGINT NOT NULL DEFAULT 0;`);
+  // Solicitações de entrada em clube, aguardando aprovação do dono/admin.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_join_requests (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (club_id, user_id)
+    );
+  `);
+  // Mesas configuráveis dentro de um clube — um clube pode ter várias,
+  // cada uma com seu próprio tipo de jogo, blinds, rake e buy-in.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_tables (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      variant TEXT NOT NULL DEFAULT 'holdem',
+      small_blind INTEGER NOT NULL,
+      big_blind INTEGER NOT NULL,
+      buy_in INTEGER NOT NULL,
+      rake_percent NUMERIC NOT NULL DEFAULT 5,
+      max_players INTEGER NOT NULL DEFAULT 9,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Histórico persistente de envio/retirada de Royalle Pay pelo dono/admin.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pay_ledger (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      admin_id INTEGER NOT NULL REFERENCES users(id),
+      type TEXT NOT NULL,
+      amount BIGINT NOT NULL,
+      balance_before BIGINT NOT NULL,
+      balance_after BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Estatísticas simples de jogo (mesas públicas), por usuário.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_stats (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      hands_played INTEGER NOT NULL DEFAULT 0,
+      hands_won INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  // Avisos gerais do app (ex: notas de atualização) — o dono do app publica,
+  // todo mundo vê. Aparece como pop-up (1x por dia, ou "não mostrar por 7
+  // dias") e também numa lista dentro de Mensagens > Avisos.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS announcements (
+      id SERIAL PRIMARY KEY,
+      version TEXT,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Notificações pessoais de cada jogador (ex: "fichas recebidas", boas-
+  // vindas ao clube). Diferente de announcements: isso é individual, não
+  // uma mensagem geral do app.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      club_id INTEGER REFERENCES clubs(id),
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Resultado (ganho/perda) de cada jogador em cada mão jogada numa mesa
+  // de CLUBE (fichas fictícias de "Jogar" fora de clube não entram aqui,
+  // de propósito — a Carreira é só sobre fichas de clube). Alimenta o
+  // gráfico e os totais da aba Carreira.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS hand_ledger (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      table_id INTEGER,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      delta BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS hand_ledger_user_idx ON hand_ledger(user_id, created_at);`);
+
+  // ============================================================
+  // TORNEIOS (MTT) — configuração persistida por torneio, e uma linha por
+  // jogador inscrito com o resultado final (posição/prêmio) depois que
+  // termina. O estado AO VIVO (nível de blind atual, mesas rodando,
+  // stacks em tempo real) fica em memória no servidor (igual a mesa de
+  // clube já funciona) — só o que precisa sobreviver um restart entra
+  // aqui: config + resultado final.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournaments (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      name TEXT NOT NULL,
+      variant TEXT NOT NULL DEFAULT 'holdem',
+      buy_in BIGINT NOT NULL DEFAULT 1000,
+      starting_chips BIGINT NOT NULL DEFAULT 10000,
+      max_players INTEGER NOT NULL DEFAULT 90,
+      min_players INTEGER NOT NULL DEFAULT 2,
+      blind_structure TEXT NOT NULL DEFAULT 'standard',
+      level_minutes INTEGER NOT NULL DEFAULT 10,
+      late_reg_minutes INTEGER NOT NULL DEFAULT 30,
+      rebuy_allowed BOOLEAN NOT NULL DEFAULT false,
+      rebuy_max INTEGER NOT NULL DEFAULT 0,
+      gtd_prize BIGINT NOT NULL DEFAULT 0,
+      start_time TIMESTAMPTZ NOT NULL,
+      created_by INTEGER NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      current_level INTEGER NOT NULL DEFAULT 0,
+      level_started_at TIMESTAMPTZ,
+      finished_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Campos extras de torneio (Early Bird, K.O./bounty, % de premiação) —
+  // adicionados depois do lançamento inicial, por isso em ALTER TABLE
+  // separado em vez de já no CREATE TABLE acima.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS early_bird_discount_pct INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS early_bird_deadline TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bounty_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bounty_percent INTEGER NOT NULL DEFAULT 50;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS payout_percent INTEGER NOT NULL DEFAULT 12;`);
+  // Nível do clube (0-10) — cada nível paga em diamantes por 30 dias e dá
+  // mais capacidade de membros/gestores, igual o "Clube Nível" do PPPoker.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS level INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS level_expires_at TIMESTAMPTZ;`);
+  // Saldo de RK — o rake coletado vira essa ficha separada, NUNCA se
+  // mistura com "treasury_chips" (o saldo normal do clube, usado pra
+  // buy-in/prêmio/envio de ficha). Evita confusão no dia do acerto.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS rk_balance BIGINT NOT NULL DEFAULT 0;`);
+
+  // Mensagens/avisos do clube — dono/gestor manda pros membros, com
+  // prazo de término obrigatório (igual pedido: "exibir sempre ao
+  // entrar no clube até o término definido").
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_messages (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      type TEXT NOT NULL DEFAULT 'texto',
+      content TEXT,
+      image TEXT,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Config do Jackpot por clube — só a configuração em si por enquanto
+  // (ligar/desligar, anúncio de premiação, % de cada pote que alimenta).
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_announce BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_percent NUMERIC NOT NULL DEFAULT 1;`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_balance BIGINT NOT NULL DEFAULT 0;`);
+
+  // Código do agente (opcional) informado ao pedir entrada no clube —
+  // guarda até a hora de aprovar, pra já vincular o membro àquele
+  // agente automaticamente assim que entrar.
+  await pool.query(`ALTER TABLE club_join_requests ADD COLUMN IF NOT EXISTS agent_username TEXT;`);
+
+  // Apelido — separado do login (username). O login é só a credencial;
+  // o apelido é o nome que aparece pro resto do app. Pedido explícito:
+  // primeiro cria a conta (login+senha), só depois define o apelido.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_entries (
+      id SERIAL PRIMARY KEY,
+      tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'registered',
+      chips BIGINT NOT NULL DEFAULT 0,
+      rebuys INTEGER NOT NULL DEFAULT 0,
+      rank INTEGER,
+      prize BIGINT NOT NULL DEFAULT 0,
+      eliminated_at TIMESTAMPTZ,
+      registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (tournament_id, user_id)
+    );
+  `);
+  // Quanto esse jogador já ganhou de prêmio de K.O. (bounty) eliminando
+  // outros — separado do "prize" (premiação por colocação final).
+  await pool.query(`ALTER TABLE tournament_entries ADD COLUMN IF NOT EXISTS bounty_won BIGINT NOT NULL DEFAULT 0;`);
+  // Valor REAL cobrado no buy-in (pode ser menor que o buy-in padrão do
+  // torneio por causa do desconto Early Bird) — reembolso tem que
+  // devolver exatamente isso, nunca o "chips" (que é só a pilha inicial
+  // de fichas do torneio, um número totalmente diferente).
+  await pool.query(`ALTER TABLE tournament_entries ADD COLUMN IF NOT EXISTS buy_in_paid BIGINT;`);
+
+  // ============================================================
+  // SISTEMA DE RAKE / RAKEBACK / AGENTE (comissão) / FECHAMENTO
+  // ============================================================
+  // "Agente" aqui é um conceito NOVO e SEPARADO do "role='agent'"
+  // (Gestor) que já existia — Gestor tem poder total igual ao dono;
+  // esse Agente só ganha comissão sobre o rake da própria carteira de
+  // membros vinculados, sem nenhum poder administrativo. As duas coisas
+  // são independentes (um membro pode ser as duas, uma, ou nenhuma).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agent_wallets (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (club_id, user_id)
+    );
+  `);
+  // Histórico de % de comissão do agente — nunca só faz UPDATE no valor;
+  // cada mudança vira uma linha nova com a data em que passou a valer,
+  // pra rake antigo continuar usando a taxa antiga (regra explícita).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS commission_rate_history (
+      id SERIAL PRIMARY KEY,
+      agent_wallet_id INTEGER NOT NULL REFERENCES agent_wallets(id),
+      rate_percent NUMERIC NOT NULL,
+      effective_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+      set_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Mesma lógica pro % de rakeback de cada membro.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rakeback_rate_history (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      member_user_id INTEGER NOT NULL REFERENCES users(id),
+      rate_percent NUMERIC NOT NULL,
+      effective_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+      set_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Vínculo membro → agente, com histórico completo (nunca apaga o
+  // vínculo antigo, só marca quando ele deixou de valer).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agent_member_links (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      member_user_id INTEGER NOT NULL REFERENCES users(id),
+      agent_wallet_id INTEGER REFERENCES agent_wallets(id),
+      linked_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+      linked_until TIMESTAMPTZ,
+      changed_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // O evento em si — um por jogador por mão, com TODOS os valores já
+  // calculados e "congelados" no momento em que aconteceu (usando a taxa
+  // que estava valendo NAQUELE instante). Isso é o que garante que mudar
+  // a % depois não recalcula o passado, e que fechamento nunca conta o
+  // mesmo evento duas vezes (closing_id NULL = ainda não fechado).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rake_events (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      member_user_id INTEGER NOT NULL REFERENCES users(id),
+      table_code TEXT,
+      gross_amount NUMERIC NOT NULL,
+      rakeback_rate NUMERIC NOT NULL DEFAULT 0,
+      rakeback_amount NUMERIC NOT NULL DEFAULT 0,
+      net_amount NUMERIC NOT NULL DEFAULT 0,
+      agent_wallet_id INTEGER REFERENCES agent_wallets(id),
+      commission_rate NUMERIC NOT NULL DEFAULT 0,
+      commission_amount NUMERIC NOT NULL DEFAULT 0,
+      club_result NUMERIC NOT NULL DEFAULT 0,
+      closing_id INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rake_closings (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      type TEXT NOT NULL,
+      period_start TIMESTAMPTZ NOT NULL,
+      period_end TIMESTAMPTZ NOT NULL,
+      closed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      closed_by INTEGER REFERENCES users(id),
+      gross_rake NUMERIC NOT NULL,
+      rakeback_total NUMERIC NOT NULL,
+      commission_total NUMERIC NOT NULL,
+      club_result NUMERIC NOT NULL,
+      status TEXT NOT NULL DEFAULT 'closed'
+    );
+  `);
+
+  console.log("Banco de dados migrado com sucesso.");
+}
