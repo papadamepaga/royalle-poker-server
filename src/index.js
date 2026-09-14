@@ -18,7 +18,7 @@ import {
   closeRakePeriod, listRakeClosings, getRakeClosingDetail, getAgentWalletSummary,
   getOrCreateQuickWallet, adjustQuickWalletChips, adjustQuickWalletGems, claimDailyBonus,
   updateUserAvatar, getUserStats, recordHandStat,
-  updateUserAvatarImage, renameUser, updateClubImage, updateClubCoverImage, setClubLevel, setMemberRole,
+  updateUserAvatarImage, renameUser, setNickname, updateClubImage, updateClubCoverImage, setClubLevel, setMemberRole,
   listClubTables, createClubTable, getClubTableById, updateClubTable, deleteClubTable,
   recordPayLedger, getPayHistory,
   createJoinRequest, hasJoinRequest, listJoinRequests, removeJoinRequest,
@@ -729,7 +729,7 @@ async function handleMessage(ws, msg, ctx) {
     ws.userId = user.id; ws.username = user.username;
     await touchLastSeen(user.id);
     const token = signToken(user.id, user.username);
-    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: null } });
+    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: null, nickname: user.nickname || null } });
     return;
   }
 
@@ -742,7 +742,7 @@ async function handleMessage(ws, msg, ctx) {
     ws.userId = user.id; ws.username = user.username;
     await touchLastSeen(user.id);
     const token = signToken(user.id, user.username);
-    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null } });
+    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
     return;
   }
 
@@ -753,7 +753,7 @@ async function handleMessage(ws, msg, ctx) {
     if (!user) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
     ws.userId = user.id; ws.username = user.username;
     await touchLastSeen(user.id);
-    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null } });
+    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
     return;
   }
 
@@ -1713,6 +1713,22 @@ async function handleMessage(ws, msg, ctx) {
     await updateUserAvatar(ws.userId, msg.avatar);
     ws.username && (ws.avatar = msg.avatar);
     ctx.reply({ ok: true, avatar: msg.avatar });
+    return;
+  }
+
+  // Apelido pessoal — separado do login/username, mostrado na mesa e no
+  // lobby. Qualquer apelido serve, só não pode repetir um já em uso
+  // (checagem sem diferenciar maiúscula/minúscula, feita no store).
+  if (type === "set_nickname") {
+    if (!requireAuth(ws, ctx)) return;
+    const trimmed = (msg.nickname || "").trim();
+    if (trimmed.length < 3 || trimmed.length > 20) return ctx.reply({ ok: false, error: "O apelido precisa ter entre 3 e 20 caracteres." });
+    const res = await setNickname(ws.userId, trimmed);
+    if (!res.ok) return ctx.reply({ ok: false, error: res.error });
+    const user = await findUserById(ws.userId);
+    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
+    const myClubs = await listClubsForUser(ws.userId);
+    for (const c of myClubs) await broadcastClub(c.code);
     return;
   }
 

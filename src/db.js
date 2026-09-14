@@ -34,6 +34,9 @@ export async function migrate() {
   // Foto de perfil enviada pelo próprio jogador (base64), opcional — quando
   // presente, tem prioridade sobre o avatar de emoji pré-definido (avatar).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_image TEXT;`);
+  // Apelido pessoal, mostrado na mesa/lobby no lugar do username — opcional,
+  // conferido como único (case-insensitive) na hora de definir.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS clubs (
       id SERIAL PRIMARY KEY,

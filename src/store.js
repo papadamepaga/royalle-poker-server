@@ -173,6 +173,22 @@ export async function renameUser(userId, newUsername) {
   return { ok: true };
 }
 
+// Apelido pessoal (mostrado na mesa/lobby no lugar do username) — mesmo
+// esquema de conferência de duplicidade (case-insensitive) do renameUser.
+export async function setNickname(userId, nickname) {
+  if (hasDatabase) {
+    const clash = await pool.query("SELECT id FROM users WHERE lower(nickname) = lower($1) AND id <> $2", [nickname, userId]);
+    if (clash.rows.length > 0) return { ok: false, error: "Esse apelido já está em uso." };
+    await pool.query("UPDATE users SET nickname = $1 WHERE id = $2", [nickname, userId]);
+    return { ok: true };
+  }
+  const clash = mem.users.find((u) => (u.nickname || "").toLowerCase() === nickname.toLowerCase() && u.id !== userId);
+  if (clash) return { ok: false, error: "Esse apelido já está em uso." };
+  const u = mem.users.find((u) => u.id === userId);
+  if (u) u.nickname = nickname;
+  return { ok: true };
+}
+
 // Foto/logo do clube (base64) — só o dono/agente chama isso; passar null
 // remove a foto e volta a mostrar o ícone de coroa padrão.
 export async function updateClubImage(clubId, image) {
@@ -552,11 +568,11 @@ export async function findUserByUsername(username) {
 
 export async function findUserById(id) {
   if (hasDatabase) {
-    const { rows } = await pool.query("SELECT id, username, avatar, avatar_image FROM users WHERE id = $1", [id]);
+    const { rows } = await pool.query("SELECT id, username, avatar, avatar_image, nickname FROM users WHERE id = $1", [id]);
     return rows[0] || null;
   }
   const u = mem.users.find((u) => u.id === id);
-  return u ? { id: u.id, username: u.username, avatar: u.avatar, avatar_image: u.avatar_image || null } : null;
+  return u ? { id: u.id, username: u.username, avatar: u.avatar, avatar_image: u.avatar_image || null, nickname: u.nickname || null } : null;
 }
 
 export async function createClub({ code, name, ownerId, smallBlind, bigBlind, buyIn, rakePercent }) {
