@@ -1,0 +1,24 @@
+{
+  "name": "royalle-poker-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "express": "^4.22.2",
+    "jsonwebtoken": "^9.0.3",
+    "nanoid": "^5.0.7",
+    "pg": "^8.23.0",
+    "ws": "^8.21.3"
+  },
+  "description": "Royalle Poker — servidor multiplayer real",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
