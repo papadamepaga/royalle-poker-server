@@ -396,6 +396,32 @@ async function pulseTournamentTable(code) {
 // Roda a cada 15s: sobe o nível de blind de torneios em andamento cujo
 // tempo do nível atual já passou, e inicia torneios agendados cujo
 // horário já chegou.
+// Relógio de inatividade: cada jogador tem 30s pra agir, mais 10s de
+// tolerância (o cliente mostra isso como "acabou, +10s"). Estourado
+// isso, age por ele — passa se der de graça, senão desiste e marca
+// "ausente" na mesa (fica assim até ele mesmo agir nela de novo).
+const ACTION_TIMEOUT_MS = 40000;
+function tickActionTimeouts() {
+  const now = Date.now();
+  for (const [code, rt] of runtime.entries()) {
+    const table = rt.table;
+    if (!table || !table.actingId) continue;
+    const p = table.players.find((pl) => pl.id === table.actingId);
+    if (!p || p.isBot) continue; // bots já têm o próprio relógio (pulseQuickTable)
+    if (table.actingId !== rt._lastActingId) {
+      rt._lastActingId = table.actingId;
+      rt._actingSince = now;
+      continue;
+    }
+    if (now - (rt._actingSince || now) >= ACTION_TIMEOUT_MS) {
+      table.autoTimeoutAction(table.actingId);
+      rt._lastActingId = table.actingId; // pode já ser o próximo jogador
+      rt._actingSince = now;
+      broadcastTable(code);
+    }
+  }
+}
+
 async function tickTournaments() {
   const now = Date.now();
   let active;
@@ -2094,6 +2120,7 @@ migrate()
     // Relógio dos torneios — confere a cada 15s se algum precisa começar
     // sozinho (chegou a hora) ou subir de nível de blind.
     setInterval(() => { tickTournaments(); }, 15000);
+    setInterval(() => { tickActionTimeouts(); }, 1000);
   })
   .catch((err) => {
     console.error("Falha ao migrar banco de dados:", err);

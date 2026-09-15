@@ -251,7 +251,7 @@ export class PokerTable {
 
   addPlayer(id, name, chips, isBot = false) {
     if (this.players.find((p) => p.id === id)) return;
-    this.players.push({ id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot });
+    this.players.push({ id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot, away: false });
   }
 
   removePlayer(id) {
@@ -345,6 +345,9 @@ export class PokerTable {
     if (this.actingId !== playerId) return { error: "Não é sua vez." };
     const p = this.players.find((pl) => pl.id === playerId);
     if (!p) return { error: "Jogador não encontrado." };
+    // Qualquer ação de verdade (manual ou automática) tira o jogador do
+    // estado "ausente" — só quem realmente não age é que fica marcado.
+    p.away = false;
 
     let raiseHappened = false;
     if (action === "fold") { p.folded = true; this.addLog(`${p.name} desiste.`); }
@@ -411,6 +414,22 @@ export class PokerTable {
     else this.actingId = this.toActQueue[0];
 
     return {};
+  }
+
+  // Chamado pelo tick do servidor quando um jogador estourou o tempo
+  // total (30s + 10s de tolerância) sem agir. Se dá pra passar de graça,
+  // passa — senão desiste, e fica marcado "ausente" na mesa até agir de
+  // novo por conta própria.
+  autoTimeoutAction(playerId) {
+    const p = this.players.find((pl) => pl.id === playerId);
+    if (!p || this.actingId !== playerId) return;
+    const toCall = this.currentBet - p.roundBet;
+    if (toCall > 0) {
+      this.applyAction(playerId, "fold");
+      p.away = true; // aplica DEPOIS — applyAction sempre zera away no início
+    } else {
+      this.applyAction(playerId, "check");
+    }
   }
 
   advanceStage() {
@@ -671,6 +690,7 @@ export class PokerTable {
           inHand: p.inHand,
           connected: p.connected,
           isBot: !!p.isBot,
+          away: !!p.away,
           cards,
           handLabel,
         };
