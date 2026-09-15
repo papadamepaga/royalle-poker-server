@@ -21,7 +21,7 @@ import {
   updateUserAvatarImage, renameUser, setNickname, updateClubImage, updateClubCoverImage, setClubLevel, setMemberRole,
   listClubTables, createClubTable, getClubTableById, updateClubTable, deleteClubTable,
   recordPayLedger, getPayHistory,
-  createJoinRequest, hasJoinRequest, listJoinRequests, removeJoinRequest,
+  createJoinRequest, hasJoinRequest, listJoinRequests, removeJoinRequest, getJoinRequestAgent,
   createAnnouncement, getLatestAnnouncement, listAnnouncements,
   createNotification, listNotifications, deleteNotification, deleteAllNotifications,
   recordHandLedger, getCareerEntries,
@@ -147,7 +147,7 @@ const BLIND_SPEED_MINUTES = { slow: 15, standard: 10, turbo: 5, hyperturbo: 3 };
 // dá mais capacidade de membros/gestores. Nível 0 é o padrão gratuito
 // (sem compra), com uma capacidade bem enxuta.
 const CLUB_LEVEL_TIERS = {
-  0: { gestor: 1, membro: 20, price: 0 },
+  0: { gestor: 1, membro: 10, price: 0 },
   1: { gestor: 3, membro: 60, price: 1500 },
   2: { gestor: 4, membro: 100, price: 2500 },
   3: { gestor: 5, membro: 150, price: 4000 },
@@ -804,9 +804,19 @@ async function handleMessage(ws, msg, ctx) {
       await broadcastClub(club.code);
       return;
     }
+    // ID do agente que indicou — opcional. Um ID inválido não deve
+    // travar o pedido de entrada, só não vincula a ninguém.
+    let agentWalletId = null;
+    if (msg.agentId) {
+      const agentUser = await findUserById(Number(msg.agentId));
+      if (agentUser) {
+        const wallet = await getAgentWallet(club.id, agentUser.id);
+        if (wallet && wallet.status === "active") agentWalletId = wallet.id;
+      }
+    }
     // Ainda não é membro — vira uma solicitação, o dono precisa aprovar
     // antes de dar acesso de verdade ao clube.
-    await createJoinRequest(club.id, ws.userId);
+    await createJoinRequest(club.id, ws.userId, agentWalletId);
     ctx.reply({ ok: true, pending: true });
     return;
   }
@@ -838,8 +848,10 @@ async function handleMessage(ws, msg, ctx) {
     if (currentCount >= membroCap) {
       return ctx.reply({ ok: false, error: `Limite de membros do nível ${level} atingido (${membroCap}). Aumente o Clube Nível pra aceitar mais gente.` });
     }
+    const pendingAgentWalletId = await getJoinRequestAgent(club.id, target.id);
     await addMember(club.id, target.id, 0, "member");
     await removeJoinRequest(club.id, target.id);
+    if (pendingAgentWalletId) await linkMemberToAgent(club.id, target.id, pendingAgentWalletId, ws.userId);
     ctx.reply({ ok: true });
     return;
   }
@@ -922,6 +934,11 @@ async function handleMessage(ws, msg, ctx) {
     const target = await findUserByUsername(msg.targetUsername);
     if (!target) return ctx.reply({ ok: false, error: "Jogador não encontrado." });
     if (!(await getMember(club.id, target.id))) return ctx.reply({ ok: false, error: "Esse jogador não é membro do clube." });
+    const { gestor: agentCap, level } = effectiveClubLevel(club);
+    const activeAgents = (await listAgentWallets(club.id)).filter((a) => a.status === "active").length;
+    if (activeAgents >= agentCap) {
+      return ctx.reply({ ok: false, error: `Limite de agentes do nível ${level} atingido (${agentCap}). Aumente o Clube Nível pra ter mais agentes.` });
+    }
     const rate = Number(msg.commissionRate ?? 0);
     if (!pctValid(rate)) return ctx.reply({ ok: false, error: "Comissão inválida (0 a 100)." });
     const agent = await createAgentWallet(club.id, target.id);

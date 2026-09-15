@@ -497,17 +497,28 @@ export async function getPayHistory(clubId, userId = null) {
 
 // ---- solicitações de entrada em clube (aprovação do dono/admin) ----
 
-export async function createJoinRequest(clubId, userId) {
+export async function createJoinRequest(clubId, userId, agentWalletId = null) {
   if (hasDatabase) {
     await pool.query(
-      `INSERT INTO club_join_requests (club_id, user_id) VALUES ($1,$2) ON CONFLICT (club_id, user_id) DO NOTHING`,
-      [clubId, userId]
+      `INSERT INTO club_join_requests (club_id, user_id, agent_wallet_id) VALUES ($1,$2,$3)
+       ON CONFLICT (club_id, user_id) DO UPDATE SET agent_wallet_id = EXCLUDED.agent_wallet_id`,
+      [clubId, userId, agentWalletId]
     );
     return;
   }
-  if (!mem.joinRequests.find((r) => r.club_id === clubId && r.user_id === userId)) {
-    mem.joinRequests.push({ id: mem.nextJoinRequestId++, club_id: clubId, user_id: userId });
+  const existing = mem.joinRequests.find((r) => r.club_id === clubId && r.user_id === userId);
+  if (existing) existing.agent_wallet_id = agentWalletId;
+  else mem.joinRequests.push({ id: mem.nextJoinRequestId++, club_id: clubId, user_id: userId, agent_wallet_id: agentWalletId });
+}
+
+// Pega o agent_wallet_id que ficou guardado no pedido (pra vincular
+// automaticamente quando o dono aprovar) — não remove o pedido.
+export async function getJoinRequestAgent(clubId, userId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("SELECT agent_wallet_id FROM club_join_requests WHERE club_id=$1 AND user_id=$2", [clubId, userId]);
+    return rows[0]?.agent_wallet_id || null;
   }
+  return mem.joinRequests.find((r) => r.club_id === clubId && r.user_id === userId)?.agent_wallet_id || null;
 }
 
 export async function hasJoinRequest(clubId, userId) {

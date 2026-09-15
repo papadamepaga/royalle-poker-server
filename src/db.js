@@ -113,6 +113,10 @@ export async function migrate() {
       UNIQUE (club_id, user_id)
     );
   `);
+  // ID do agente que indicou o jogador (opcional, digitado na hora de
+  // pedir pra entrar) — vira o vínculo agente/jogador automaticamente
+  // quando o dono aprova, sem precisar vincular na mão depois.
+  await pool.query(`ALTER TABLE club_join_requests ADD COLUMN IF NOT EXISTS agent_wallet_id INTEGER;`);
   // Mesas configuráveis dentro de um clube — um clube pode ter várias,
   // cada uma com seu próprio tipo de jogo, blinds, rake e buy-in.
   await pool.query(`
