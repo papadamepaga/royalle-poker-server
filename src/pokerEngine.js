@@ -600,6 +600,11 @@ export class PokerTable {
       stage: this.stage,
       community: this.community,
       pot: this.pot,
+      // Quebra do pote em potes separados quando alguém já foi all-in por
+      // menos (side pot) — cada um com seu valor e quem ainda disputa
+      // ele, pra UI mostrar montinhos distintos em vez de um só
+      // aglomerado (nem todo mundo disputa todo pote).
+      pots: this.pot > 0 ? computePots(this.players) : [],
       currentBet: this.currentBet,
       minRaise: this.minRaise,
       actingId: this.actingId,
