@@ -85,6 +85,14 @@ const wss = new WebSocketServer({ server: httpServer });
 // the live PokerTable instance and which sockets are currently watching
 // or seated at a given club.
 const runtime = new Map(); // code -> { clubId, sockets: Set<ws>, socketToPlayer: Map<ws, username>, table: PokerTable|null }
+// Registro global de quem está online agora (username -> ws), pra poder
+// empurrar avisos pra alguém mesmo fora do contexto de uma mesa/clube
+// específico — como "seu torneio começou, você está na mesa X".
+const onlineByUsername = new Map();
+function pushToUser(username, msg) {
+  const ws = onlineByUsername.get(username);
+  if (ws && ws.readyState === ws.OPEN) send(ws, msg);
+}
 
 function ensureRuntime(code, clubId) {
   if (!runtime.has(code)) runtime.set(code, { clubId, clubCode: code, sockets: new Set(), socketToPlayer: new Map(), table: null });
@@ -276,7 +284,14 @@ async function startTournament(t) {
   await updateTournament(t.id, { status: "running", currentLevel: 0, levelStartedAt: new Date().toISOString() });
   tables.forEach((table, idx) => {
     table.startHand();
-    broadcastTable(tournamentTableCode(clubCode, t.id, idx));
+    const code = tournamentTableCode(clubCode, t.id, idx);
+    broadcastTable(code);
+    // Ninguém tem socket "escutando" essa mesa ainda (ela acabou de
+    // nascer) — avisa cada jogador direto, onde quer que ele esteja no
+    // app agora, pra aparecer o botão de "ir pra mesa" no topo.
+    for (const p of table.players) {
+      pushToUser(p.id, { type: "table_assigned", code, kind: "tournament", tournamentName: t.name });
+    }
   });
 }
 
@@ -753,6 +768,7 @@ async function handleMessage(ws, msg, ctx) {
     const user = await createUser(username, hash, avatar);
     if (!user) return ctx.reply({ ok: false, error: "Não deu pra criar a conta." });
     ws.userId = user.id; ws.username = user.username;
+    onlineByUsername.set(ws.username, ws);
     await touchLastSeen(user.id);
     const token = signToken(user.id, user.username);
     ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: null, nickname: user.nickname || null } });
@@ -766,6 +782,7 @@ async function handleMessage(ws, msg, ctx) {
     const valid = await verifyPassword(msg.password || "", user.password_hash);
     if (!valid) return ctx.reply({ ok: false, error: "Usuário ou senha incorretos." });
     ws.userId = user.id; ws.username = user.username;
+    onlineByUsername.set(ws.username, ws);
     await touchLastSeen(user.id);
     const token = signToken(user.id, user.username);
     ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
@@ -778,6 +795,7 @@ async function handleMessage(ws, msg, ctx) {
     const user = await findUserById(payload.sub);
     if (!user) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
     ws.userId = user.id; ws.username = user.username;
+    onlineByUsername.set(ws.username, ws);
     await touchLastSeen(user.id);
     ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
     return;
@@ -2101,6 +2119,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("Conexão WebSocket fechada.");
+    if (ws.username && onlineByUsername.get(ws.username) === ws) onlineByUsername.delete(ws.username);
     if (!joinedCode) return;
     const rt = runtime.get(joinedCode);
     if (!rt) return;
