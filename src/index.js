@@ -807,6 +807,13 @@ async function handleMessage(ws, msg, ctx) {
       await updateClubCoverImage(club.id, msg.coverImage);
       club.cover_image = msg.coverImage;
     }
+    // Foto de perfil do clube (diferente da capa) — mesmo mecanismo do
+    // "update_club_image" que já existia pra trocar depois, só que
+    // preenchido de cara quando o dono já manda uma na criação.
+    if (msg.image && typeof msg.image === "string" && msg.image.length <= 1_900_000) {
+      await updateClubImage(club.id, msg.image);
+      club.image = msg.image;
+    }
     await addMember(club.id, ws.userId, 0, "owner");
     const rt = ensureRuntime(code, club.id);
     rt.sockets.add(ws);
