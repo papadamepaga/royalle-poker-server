@@ -179,7 +179,7 @@ function effectiveClubLevel(club) {
 // Formata um torneio (linha crua do banco) pro formato que o cliente
 // entende — camelCase, com contagens já calculadas, e o status da
 // inscrição de quem está pedindo (se já tiver uma).
-function publicTournament(t, entries, myEntry) {
+function publicTournament(t, entries, myEntry, myUsername) {
   const active = entries.filter((e) => e.status !== "cancelled");
   const totalBuyIns = active.reduce((s, e) => s + Number(e.buy_in_paid ?? t.buy_in), 0);
   const totalBountyPaid = entries.reduce((s, e) => s + Number(e.bounty_won || 0), 0);
@@ -188,11 +188,15 @@ function publicTournament(t, entries, myEntry) {
   const payoutTable = fractions.map((f, i) => ({ rank: i + 1, prize: Math.round(estimatedPool * f) }));
   // Mesas ainda em jogo desse torneio, pra aba "Mesas" — não depende de
   // nada além de vasculhar o runtime, já que cada mesa de torneio guarda
-  // o próprio tournamentId.
+  // o próprio tournamentId. De passagem já acha em qual mesa o jogador
+  // que está perguntando está sentado agora, pra dar o botão de "entrar
+  // na minha mesa" sem ele precisar ficar procurando.
   const tables = [];
+  let myTableCode = null;
   for (const [code, rt] of runtime.entries()) {
     if (rt.tournamentId === t.id && rt.table) {
       tables.push({ code, playersLeft: rt.table.players.length, avgStack: rt.table.players.length ? Math.round(rt.table.players.reduce((s, p) => s + p.chips, 0) / rt.table.players.length) : 0 });
+      if (myUsername && rt.table.players.some((p) => p.name === myUsername)) myTableCode = code;
     }
   }
   return {
@@ -209,7 +213,7 @@ function publicTournament(t, entries, myEntry) {
     playersLeft: active.filter((e) => e.status === "playing" || e.status === "registered").length,
     myStatus: myEntry ? myEntry.status : null,
     myBuyInPaid: myEntry ? Number(myEntry.buy_in_paid ?? t.buy_in) : null,
-    estimatedPool, payoutTable, tables,
+    estimatedPool, payoutTable, tables, myTableCode,
   };
 }
 
@@ -1419,7 +1423,7 @@ async function handleMessage(ws, msg, ctx) {
     const withCounts = await Promise.all(list.map(async (t) => {
       const entries = await listTournamentEntries(t.id);
       const mine = entries.find((e) => e.user_id === ws.userId);
-      return publicTournament(t, entries, mine);
+      return publicTournament(t, entries, mine, ws.username);
     }));
     ctx.reply({ ok: true, tournaments: withCounts });
     return;
@@ -1484,7 +1488,7 @@ async function handleMessage(ws, msg, ctx) {
     const mine = entries.find((e) => e.user_id === ws.userId);
     ctx.reply({
       ok: true,
-      tournament: publicTournament(t, entries, mine),
+      tournament: publicTournament(t, entries, mine, ws.username),
       entries: entries
         .slice()
         .sort((a, b) => (a.rank || 999) - (b.rank || 999) || new Date(a.registered_at) - new Date(b.registered_at))
