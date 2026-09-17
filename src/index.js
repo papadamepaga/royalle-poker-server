@@ -1607,6 +1607,29 @@ async function handleMessage(ws, msg, ctx) {
   // saísse da tela sem clicar em "Sair da mesa" ficava preso: tentar
   // "Sentar" de novo cobrava outro buy-in do saldo pessoal (que já
   // tinha sido gasto na primeira vez) e travava sem conseguir voltar.
+  // Handler genérico de "estou vendo essa mesa, me manda as atualizações" —
+  // cobre TODO caminho que leva a uma tela de mesa sem passar por
+  // sit_table (reconectar depois de queda, entrar via "Entrar na minha
+  // mesa" do torneio, clicar na barra de mesas ativas). Sem isso o socket
+  // nunca entra em rt.socketToPlayer e a mesa fica "Abrindo a mesa…" pra
+  // sempre, mesmo com o jogador de verdade sentado nela. Só reconecta —
+  // nunca senta, nunca cobra buy-in; se o jogador não estiver mesmo
+  // sentado ali, recusa.
+  if (type === "watch_table") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table || !rt.table.players.some((p) => p.id === ws.username)) {
+      return ctx.reply({ ok: false, error: "Você não está sentado nessa mesa." });
+    }
+    rt.sockets.add(ws);
+    rt.socketToPlayer.set(ws, ws.username);
+    ctx.setJoinedCode?.(code);
+    ctx.reply({ ok: true, code });
+    broadcastTable(code);
+    return;
+  }
+
   if (type === "rejoin_club_table") {
     if (!requireAuth(ws, ctx)) return;
     const club = await getClubByCode((msg.code || "").toUpperCase());
