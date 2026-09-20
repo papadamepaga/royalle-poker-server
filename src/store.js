@@ -640,19 +640,27 @@ export async function getMember(clubId, userId) {
 
 export async function listMembers(clubId) {
   if (hasDatabase) {
+    // u.nickname é o apelido que o PRÓPRIO jogador escolhe no perfil dele
+    // (nome que aparece na mesa/lobby); m.nickname é o apelido que o
+    // dono/agente do clube define pra essa pessoa especificamente dentro
+    // deste clube (editável em "Gerenciamento de membro"). São coisas
+    // diferentes — por isso vêm em campos separados (display_name vs
+    // nickname), pra tela de Membros poder mostrar o nome de jogo de
+    // verdade em vez do login cru quando o clube não tiver apelido próprio
+    // definido pra essa pessoa.
     const { rows } = await pool.query(
-      `SELECT u.id, u.username, u.avatar, u.avatar_image, u.last_seen, m.chips, m.role, m.nickname, m.note, m.joined_at
+      `SELECT u.id, u.username, u.nickname AS display_name, u.avatar, u.avatar_image, u.last_seen, m.chips, m.role, m.nickname, m.note, m.joined_at
        FROM club_members m JOIN users u ON u.id = m.user_id
        WHERE m.club_id = $1 ORDER BY m.joined_at ASC`,
       [clubId]
     );
-    return rows;
+    return rows.map((r) => ({ ...r, displayName: r.display_name || null }));
   }
   return mem.members
     .filter((m) => m.club_id === clubId)
     .map((m) => {
       const u = mem.users.find((u) => u.id === m.user_id);
-      return { id: u.id, username: u.username, avatar: u.avatar, avatar_image: u.avatar_image || null, last_seen: u.last_seen || null, chips: m.chips, role: m.role, nickname: m.nickname || null, note: m.note || null, joined_at: m.joined_at };
+      return { id: u.id, username: u.username, displayName: u.nickname || null, avatar: u.avatar, avatar_image: u.avatar_image || null, last_seen: u.last_seen || null, chips: m.chips, role: m.role, nickname: m.nickname || null, note: m.note || null, joined_at: m.joined_at };
     });
 }
 
