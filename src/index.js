@@ -1728,6 +1728,41 @@ async function handleMessage(ws, msg, ctx) {
     return;
   }
 
+  if (type === "add_chips_at_table") {
+    // Recompra ("Mais Fichas" no menu ☰ da mesa) — o frontend já chamava
+    // esse tipo de mensagem há tempos, só que ele nunca existiu aqui no
+    // servidor, então todo pedido de recompra sempre voltava com erro.
+    // Cobre tanto mesa de clube (rt.clubId, débito na carteira do
+    // clube) quanto mesa pública (rt.isQuick, débito na carteira avulsa).
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const player = rt.table.players.find((p) => p.id === ws.username);
+    if (!player) return ctx.reply({ ok: false, error: "Você não está sentado nessa mesa." });
+    if (rt.table.stage !== "idle" && rt.table.stage !== "showdown") {
+      return ctx.reply({ ok: false, error: "Só dá pra recomprar fora de uma mão em andamento." });
+    }
+    const amount = Math.floor(Number(msg.amount) || 0);
+    if (amount <= 0) return ctx.reply({ ok: false, error: "Quantidade inválida." });
+    if (rt.clubId) {
+      const member = await getMember(rt.clubId, ws.userId);
+      if (!member || Number(member.chips) < amount) return ctx.reply({ ok: false, error: "Royalle Pay insuficiente." });
+      await adjustMemberChips(rt.clubId, ws.userId, -amount);
+    } else if (rt.isQuick) {
+      const wallet = await getOrCreateQuickWallet(ws.userId);
+      if (Number(wallet.chips) < amount) return ctx.reply({ ok: false, error: "Fichas insuficientes." });
+      await adjustQuickWalletChips(ws.userId, -amount);
+    } else {
+      return ctx.reply({ ok: false, error: "Essa mesa não aceita recompra." });
+    }
+    player.chips += amount;
+    recordSessionBuyIn(rt.table, ws.username, amount);
+    ctx.reply({ ok: true });
+    broadcastTable(code);
+    return;
+  }
+
   if (type === "start_hand") {
     if (!requireAuth(ws, ctx)) return;
     const code = (msg.code || "").toUpperCase();
