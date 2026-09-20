@@ -1660,7 +1660,7 @@ async function handleMessage(ws, msg, ctx) {
     if (!t) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
     const code = `${club.code}#${t.id}`;
     const rt = ensureRuntime(code, club.id);
-    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant });
+    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
@@ -1699,8 +1699,8 @@ async function handleMessage(ws, msg, ctx) {
     rt.isQuick = false; // usa carteira de clube (Royalle Pay), não a avulsa
     rt.clubId = club.id;
     rt.clubCode = club.code;
-    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant });
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false);
+    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
     recordSessionBuyIn(rt.table, ws.username, buyIn);
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);

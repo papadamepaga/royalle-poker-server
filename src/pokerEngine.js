@@ -214,12 +214,17 @@ function computeWinProbs(contenders, community, variant) {
 }
 
 export class PokerTable {
-  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0, variant = "holdem" } = {}) {
+  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0, variant = "holdem", maxSeats = 9 } = {}) {
     this.smallBlind = smallBlind;
     this.bigBlind = bigBlind;
     this.rakePercent = rakePercent; // e.g. 5 means 5% of each pot
     this.variant = variant; // "holdem" | "plo4" | "plo5" | "plo6" (só holdem implementado por enquanto)
-    this.players = []; // { id, name, chips, cards, folded, allIn, inHand, roundBet, totalBet, connected, isBot }
+    // Quantidade de assentos físicos ao redor da mesa — fixo desde a
+    // criação, independe de quantos estão sentados agora. É o que deixa
+    // a UI desenhar um "+" nos vazios em vez de só reorganizar todo
+    // mundo mais apertado a cada entrada/saída.
+    this.maxSeats = Math.max(2, Number(maxSeats) || 9);
+    this.players = []; // { id, name, chips, cards, folded, allIn, inHand, roundBet, totalBet, connected, isBot, seat }
     this.deck = [];
     this.community = [];
     this.stage = "idle"; // idle | preflop | flop | turn | river | showdown
@@ -249,9 +254,24 @@ export class PokerTable {
     if (this.log.length > 30) this.log.shift();
   }
 
-  addPlayer(id, name, chips, isBot = false) {
+  addPlayer(id, name, chips, isBot = false, seat = null) {
     if (this.players.find((p) => p.id === id)) return;
-    this.players.push({ id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot, away: false });
+    const taken = new Set(this.players.map((p) => p.seat));
+    let seatIndex = Number.isInteger(seat) && seat >= 0 && seat < this.maxSeats && !taken.has(seat) ? seat : null;
+    if (seatIndex === null) {
+      // Sem assento pedido (bots, mesa rápida, torneio) ou o pedido já
+      // tava ocupado — pega o primeiro vazio disponível.
+      for (let i = 0; i < this.maxSeats; i++) { if (!taken.has(i)) { seatIndex = i; break; } }
+      if (seatIndex === null) return; // mesa cheia
+    }
+    const player = { id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot, away: false, seat: seatIndex };
+    // Mantém this.players sempre ordenado por assento físico — o resto
+    // da engine (ordem de ação, rotação do dealer) caminha por esse
+    // array em sequência assumindo que ele já representa a ordem física
+    // ao redor da mesa, então quem entra precisa ser inserido no lugar
+    // certo, não só empilhado no fim.
+    const idx = this.players.findIndex((p) => p.seat > seatIndex);
+    if (idx === -1) this.players.push(player); else this.players.splice(idx, 0, player);
   }
 
   removePlayer(id) {
@@ -656,6 +676,7 @@ export class PokerTable {
       smallBlind: this.smallBlind,
       bigBlind: this.bigBlind,
       variant: this.variant,
+      maxSeats: this.maxSeats,
       // Pra UI saber quantas cartas mostrar antes de distribuir e se deve
       // aplicar o teto de Pot-Limit no slider — sem precisar hardcodar
       // "PLO4/5/6" em lugar nenhum do cliente também.
@@ -691,6 +712,7 @@ export class PokerTable {
           connected: p.connected,
           isBot: !!p.isBot,
           away: !!p.away,
+          seat: p.seat,
           cards,
           handLabel,
         };
