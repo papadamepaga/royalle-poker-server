@@ -595,7 +595,7 @@ export async function createClub({ code, name, ownerId, smallBlind, bigBlind, bu
     );
     return rows[0];
   }
-  const club = { id: mem.nextClubId++, code, name, owner_id: ownerId, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, treasury_chips: 10000, level: 0, level_expires_at: null, rk_balance: 0 };
+  const club = { id: mem.nextClubId++, code, name, owner_id: ownerId, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, treasury_chips: 10000, level: 0, level_expires_at: null, rk_balance: 0, jackpot_enabled: false, jackpot_rake_percent: 0, jackpot_balance: 0 };
   mem.clubs.push(club);
   return club;
 }
@@ -782,6 +782,36 @@ export async function adjustClubRkBalance(clubId, delta) {
   if (c.rk_balance === undefined) c.rk_balance = 0;
   c.rk_balance = Math.max(0, c.rk_balance + delta);
   return c.rk_balance;
+}
+
+// Liga/desliga o jackpot do clube e define quanto do rake do clube (não
+// o rake inteiro, só a fatia que já seria dele) vira pote. 0-100%, só o
+// dono mexe.
+export async function setJackpotConfig(clubId, { enabled, rakePercent }) {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(rakePercent) || 0)));
+  if (hasDatabase) {
+    await pool.query("UPDATE clubs SET jackpot_enabled=$1, jackpot_rake_percent=$2 WHERE id=$3", [!!enabled, pct, clubId]);
+    return;
+  }
+  const club = mem.clubs.find((c) => c.id === clubId);
+  if (club) { club.jackpot_enabled = !!enabled; club.jackpot_rake_percent = pct; }
+}
+
+// Soma (ou subtrai, com delta negativo) direto no pote acumulado —
+// usada tanto pela fatia automática do rake quanto pela injeção manual
+// do dono. Nunca deixa negativo.
+export async function addJackpotChips(clubId, delta) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      "UPDATE clubs SET jackpot_balance = GREATEST(0, jackpot_balance + $1) WHERE id=$2 RETURNING jackpot_balance",
+      [delta, clubId]
+    );
+    return rows[0] ? Number(rows[0].jackpot_balance) : 0;
+  }
+  const club = mem.clubs.find((c) => c.id === clubId);
+  if (!club) return 0;
+  club.jackpot_balance = Math.max(0, Number(club.jackpot_balance || 0) + delta);
+  return club.jackpot_balance;
 }
 
 export async function recordRake(clubId, amount, platformAmount = 0) {

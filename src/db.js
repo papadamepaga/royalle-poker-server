@@ -243,6 +243,14 @@ export async function migrate() {
   // mistura com "treasury_chips" (o saldo normal do clube, usado pra
   // buy-in/prêmio/envio de ficha). Evita confusão no dia do acerto.
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS rk_balance BIGINT NOT NULL DEFAULT 0;`);
+  // Jackpot do clube — opcional, o dono liga/desliga e escolhe quanto do
+  // rake alimenta o pote (0-100%). jackpot_balance é o pote acumulado em
+  // si, separado de tudo o mais (nunca se mistura com treasury_chips nem
+  // rk_balance) — só cresce por essa fatia do rake e por injeção manual
+  // do dono, e só ele decide gastar/zerar.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_rake_percent INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_balance BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_entries (
       id SERIAL PRIMARY KEY,

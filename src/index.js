@@ -10,6 +10,7 @@ import {
   AVATAR_OPTIONS, createUser, findUserByUsername, findUserById,
   createClub, getClubByCode, getClubById, addMember, getMember, listMembers, listClubsForUser,
   adjustMemberChips, adjustClubTreasury, recordRake, getWeeklyRake, getTotalRake, getTotalPlatformRake,
+  setJackpotConfig, addJackpotChips,
   createAgentWallet, getAgentWallet, getAgentWalletById, listAgentWallets, setAgentStatus,
   setCommissionRate, getCurrentCommissionRate, listCommissionRateHistory,
   setRakebackRate, getCurrentRakebackRate, listRakebackRateHistory,
@@ -638,7 +639,7 @@ function broadcastTable(code) {
   const table = rt?.table;
   if (!table) return;
   for (const [ws, username] of rt.socketToPlayer.entries()) {
-    send(ws, { type: "table_state", state: table.getPublicState(username) });
+    send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null } });
   }
   maybeRecordRake(rt, code);
   maybeRecordHandLedger(rt, code);
@@ -666,7 +667,22 @@ async function maybeRecordRake(rt, code) {
     rt.table.pendingRake = 0;
     rt.table.pendingPlatformRake = 0;
     rt.table.pendingRakeByPlayer = {};
-    if (rt.clubId) await recordRake(rt.clubId, clubAmount, platformAmount);
+    // Antes de gravar o rake do clube, separa a fatia do jackpot (se
+    // estiver ligado) — o resto continua indo pro rake normal igual
+    // sempre foi. O jackpot nunca reduz o que o jogador recebe: essa
+    // fatia já era do clube, só troca de bolso.
+    let clubAmountAfterJackpot = clubAmount;
+    if (rt.clubId && clubAmount > 0) {
+      const club = await getClubById(rt.clubId);
+      if (club?.jackpot_enabled && Number(club.jackpot_rake_percent) > 0) {
+        const jackpotCut = Math.floor((clubAmount * Number(club.jackpot_rake_percent)) / 100);
+        if (jackpotCut > 0) {
+          await addJackpotChips(rt.clubId, jackpotCut);
+          clubAmountAfterJackpot -= jackpotCut;
+        }
+      }
+    }
+    if (rt.clubId) await recordRake(rt.clubId, clubAmountAfterJackpot, platformAmount);
     // Sistema de rake/rakeback/agente — só faz sentido em mesa de CLUBE
     // de verdade (fichas reais), nunca em mesa pública/torneio (fichas
     // fictícias, sem membro de clube por trás). Um evento por jogador,
@@ -734,12 +750,17 @@ function publicClub(club, viewerIsOwner, extra = {}) {
     buyIn: club.buy_in,
     rakePercent: Number(club.rake_percent),
     ownerId: club.owner_id,
+    // O saldo do jackpot é vitrine — todo membro vê quanto tem
+    // acumulado (igual o telão de cassino), só a configuração (% do
+    // rake) é administrativa.
+    jackpotEnabled: !!club.jackpot_enabled,
+    jackpotBalance: Number(club.jackpot_balance || 0),
   };
   // Tesouraria e rake acumulado são informação administrativa — só o
   // dono/admin recebe esses campos. Pra membro comum, nem chegam a existir
   // no payload (não é só esconder na interface).
   if (viewerIsOwner) {
-    return { ...base, treasuryChips: Number(club.treasury_chips), totalRake: extra.totalRake ?? 0, platformRake: extra.platformRake ?? 0 };
+    return { ...base, treasuryChips: Number(club.treasury_chips), totalRake: extra.totalRake ?? 0, platformRake: extra.platformRake ?? 0, jackpotRakePercent: Number(club.jackpot_rake_percent || 0) };
   }
   return base;
 }
@@ -943,6 +964,38 @@ async function handleMessage(ws, msg, ctx) {
     await adjustQuickWalletGems(ws.userId, -tier.price);
     const expiresAt = await setClubLevel(club.id, level);
     ctx.reply({ ok: true, level, expiresAt, gems: wallet.gems - tier.price });
+    return;
+  }
+
+  // Jackpot do clube — liga/desliga e define quanto % do rake do clube
+  // (não do total, só da fatia que já seria dele) alimenta o pote.
+  if (type === "set_jackpot_config") {
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const me = await getMember(club.id, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Só o dono ou um gestor pode mexer no jackpot." });
+    await setJackpotConfig(club.id, { enabled: !!msg.enabled, rakePercent: msg.rakePercent });
+    ctx.reply({ ok: true });
+    await broadcastClub(club.code);
+    return;
+  }
+
+  // Injeta fichas do CAIXA do clube direto no pote do jackpot — desconta
+  // da tesouraria normal (treasury_chips), nunca fabrica ficha do nada.
+  if (type === "add_jackpot_chips") {
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const me = await getMember(club.id, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Só o dono ou um gestor pode alimentar o jackpot." });
+    const amount = Math.floor(Number(msg.amount) || 0);
+    if (amount <= 0) return ctx.reply({ ok: false, error: "Quantidade inválida." });
+    if (Number(club.treasury_chips) < amount) return ctx.reply({ ok: false, error: "Saldo do clube insuficiente." });
+    await adjustClubTreasury(club.id, -amount);
+    await addJackpotChips(club.id, amount);
+    ctx.reply({ ok: true });
+    await broadcastClub(club.code);
     return;
   }
 
@@ -1192,7 +1245,7 @@ async function handleMessage(ws, msg, ctx) {
       members: membersForViewer(members, ws.username, viewerIsOwner),
       weeklyRake,
     });
-    if (rt.table) send(ws, { type: "table_state", state: rt.table.getPublicState(ws.username) });
+    if (rt.table) send(ws, { type: "table_state", state: { ...rt.table.getPublicState(ws.username), tableName: rt.tableName || null, tableId: rt.tableId ?? null } });
     return;
   }
 
@@ -1661,6 +1714,7 @@ async function handleMessage(ws, msg, ctx) {
     const code = `${club.code}#${t.id}`;
     const rt = ensureRuntime(code, club.id);
     if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
+    rt.tableName = t.name; rt.tableId = t.id;
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
@@ -1699,6 +1753,7 @@ async function handleMessage(ws, msg, ctx) {
     rt.isQuick = false; // usa carteira de clube (Royalle Pay), não a avulsa
     rt.clubId = club.id;
     rt.clubCode = club.code;
+    rt.tableName = t.name; rt.tableId = t.id;
     if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
     rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
     recordSessionBuyIn(rt.table, ws.username, buyIn);
