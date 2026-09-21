@@ -595,7 +595,7 @@ export async function createClub({ code, name, ownerId, smallBlind, bigBlind, bu
     );
     return rows[0];
   }
-  const club = { id: mem.nextClubId++, code, name, owner_id: ownerId, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, treasury_chips: 10000, level: 0, level_expires_at: null, rk_balance: 0, jackpot_enabled: false, jackpot_rake_percent: 0, jackpot_balance: 0 };
+  const club = { id: mem.nextClubId++, code, name, owner_id: ownerId, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, treasury_chips: 10000, level: 0, level_expires_at: null, rk_balance: 0, jackpot_enabled: false, jackpot_rake_percent: 0, jackpot_balance: 0, jackpot_type: "mixed", jackpot_fee_mode: "per_pot" };
   mem.clubs.push(club);
   return club;
 }
@@ -784,17 +784,29 @@ export async function adjustClubRkBalance(clubId, delta) {
   return c.rk_balance;
 }
 
-// Liga/desliga o jackpot do clube e define quanto do rake do clube (não
-// o rake inteiro, só a fatia que já seria dele) vira pote. 0-100%, só o
-// dono mexe.
-export async function setJackpotConfig(clubId, { enabled, rakePercent }) {
-  const pct = Math.max(0, Math.min(100, Math.round(Number(rakePercent) || 0)));
+// Percentual do rake do clube que vira pote — modelo simplificado
+// (a tabela oficial do pppoker é uma matriz enorme indexada por BB/ante
+// e por tipo; aqui uso uma fatia fixa por modo de cobrança, até ter uma
+// versão que calcula por nível de blind de verdade).
+const JACKPOT_TYPE_IDS = ["mixed", "cooler", "cooler_plus"];
+const JACKPOT_FEE_MODE_IDS = ["per_hand", "per_pot"];
+function jackpotRakePercentFor(feeMode) { return feeMode === "per_hand" ? 2 : 5; }
+
+// Liga/desliga o jackpot do clube e define tipo + modo de cobrança da
+// taxa — só o dono/gestor mexe.
+export async function setJackpotConfig(clubId, { enabled, type, feeMode }) {
+  const t = JACKPOT_TYPE_IDS.includes(type) ? type : "mixed";
+  const fm = JACKPOT_FEE_MODE_IDS.includes(feeMode) ? feeMode : "per_pot";
+  const pct = jackpotRakePercentFor(fm);
   if (hasDatabase) {
-    await pool.query("UPDATE clubs SET jackpot_enabled=$1, jackpot_rake_percent=$2 WHERE id=$3", [!!enabled, pct, clubId]);
+    await pool.query(
+      "UPDATE clubs SET jackpot_enabled=$1, jackpot_type=$2, jackpot_fee_mode=$3, jackpot_rake_percent=$4 WHERE id=$5",
+      [!!enabled, t, fm, pct, clubId]
+    );
     return;
   }
   const club = mem.clubs.find((c) => c.id === clubId);
-  if (club) { club.jackpot_enabled = !!enabled; club.jackpot_rake_percent = pct; }
+  if (club) { club.jackpot_enabled = !!enabled; club.jackpot_type = t; club.jackpot_fee_mode = fm; club.jackpot_rake_percent = pct; }
 }
 
 // Soma (ou subtrai, com delta negativo) direto no pote acumulado —

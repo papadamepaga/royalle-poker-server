@@ -91,6 +91,82 @@ export function compareScores(a, b) {
   }
   return 0;
 }
+
+// A regra "as duas cartas da mão devem ser usadas" É ESPECÍFICA de cada
+// tipo de mão — não basta 2 das 5 cartas finais baterem com a mão do
+// jogador, porque numa quadra a 5ª carta é só kicker (poderia vir do
+// board sem problema e não conta pra qualificar). O que precisa mesmo:
+// - Quadra: as DUAS cartas da mão formam o par que virou quadra (mesmo
+//   rank da quadra nas duas).
+// - Full House (só Hold'em, quadra perdendo): mesma ideia, só que o par
+//   da mão virou a TRINCA (rank >= valete).
+// - Straight/Royal Flush: as duas cartas da mão estão entre as 5 que
+//   formam a sequência (não interessa qual posição).
+// Quais das 5 cartas finais vieram da mão do jogador — funciona tanto
+// pro Hold'em (2 cartas na mão) quanto pro Omaha (4/5/6 cartas na mão,
+// mas só 2 delas entram na mão final de qualquer jeito, pela regra da
+// própria variante). Casa por rank+naipe.
+function usedHoleCards(score, holeCards) {
+  if (!score?.cards || !holeCards) return [];
+  const pool = [...holeCards];
+  const used = [];
+  for (const c of score.cards) {
+    const idx = pool.findIndex((h) => h.rank === c.rank && h.suit === c.suit);
+    if (idx !== -1) { used.push(pool[idx]); pool.splice(idx, 1); }
+  }
+  return used;
+}
+function jackpotQualifies(score, holeCards) {
+  if (!score) return false;
+  const used = usedHoleCards(score, holeCards);
+  if (score.category === 8) return used.length === 2; // straight/royal flush: as 5 cartas finais SÃO a sequência, então "2 usadas" já garante que formaram a sequência
+  if (score.category === 7) return used.filter((c) => c.rank === score.kickers[0]).length === 2; // quadra: as duas cartas da mão têm que SER o par que virou quadra (não um kicker qualquer)
+  if (score.category === 6 && score.kickers[0] >= 11) return used.filter((c) => c.rank === score.kickers[0]).length === 2; // full house de valetes+: par da mão virou a trinca
+  return false;
+}
+
+// Detecta se essa mão (já resolvida, showdown de verdade com 2+
+// contendores) rendeu um evento de Jackpot — Cooler (quadra perde pra
+// quadra ou melhor) ou Mão Forte (quadra/straight flush/royal flush
+// vence sem cooler). Função pura: só olha as mãos já calculadas, não
+// mexe em fichas nem em pote — quem paga o prêmio de verdade é o
+// index.js (ele já sabe se o clube tem jackpot ligado e de que tipo).
+// holeCardsById: { [playerId]: cartas da mão desse jogador }.
+export function detectJackpotEvent(scored, contenderIds, holeCardsById, variant) {
+  const ranked = contenderIds
+    .map((id) => ({ id, score: scored[id] }))
+    .filter((r) => r.score)
+    .sort((a, b) => compareScores(b.score, a.score));
+  if (ranked.length < 1) return null;
+  const top = ranked[0];
+  const second = ranked[1];
+  const isQuadPlus = (s) => s.category >= 7;
+  const qualifies = (r) => jackpotQualifies(r.score, holeCardsById[r.id]);
+
+  // COOLER — quadra (ou melhor) perde pra quadra (ou melhor). No
+  // Hold'em, Full House de valetes+ perdendo pra quadra também conta.
+  if (second && isQuadPlus(top.score) && qualifies(top)) {
+    if (isQuadPlus(second.score) && qualifies(second)) {
+      return { kind: "cooler", winnerId: top.id, loserId: second.id, loserCategory: second.score.category };
+    }
+    if (variant === "holdem" && second.score.category === 6 && qualifies(second)) {
+      return { kind: "cooler", winnerId: top.id, loserId: second.id, loserCategory: 6 };
+    }
+  }
+
+  // MÃO FORTE — sem cooler, o vencedor sozinho bate quadra (só Hold'em),
+  // straight flush ou royal flush.
+  if (qualifies(top)) {
+    if (top.score.category === 8) {
+      const isRoyal = top.score.kickers[0] === 14;
+      return { kind: "strong", winnerId: top.id, trigger: isRoyal ? "royal" : "straightflush" };
+    }
+    if (top.score.category === 7 && variant === "holdem") {
+      return { kind: "strong", winnerId: top.id, trigger: "quads" };
+    }
+  }
+  return null;
+}
 function bestOf7(cards7) {
   let best = null;
   for (const c of combinations(cards7, 5)) {
@@ -504,6 +580,8 @@ export class PokerTable {
     const tags = {};
     this.pendingRake = 0;
     this.pendingPlatformRake = 0;
+    this.pendingJackpotEvent = null;
+    this.pendingJackpotDealtIds = [];
     // Quanto rake cada jogador "gerou" nessa mão — proporcional ao que
     // ele colocou no(s) pote(s) raked, mesmo se desistiu (o dinheiro dele
     // continua fazendo parte do pote que foi taxado). Base de tudo que
@@ -519,6 +597,14 @@ export class PokerTable {
       const pots = computePots(this.players);
       const scored = {};
       contenders.forEach((p) => { scored[p.id] = bestHandFor(p.cards, this.community, this.variant); });
+      // Detecta Cooler/Mão Forte pra essa mão — só a detecção pura aqui;
+      // quem decide se paga (jackpot ligado? qual tipo? qual %?) e quem
+      // efetivamente credita as fichas é o index.js, logo depois de
+      // broadcastar essa mesma resolução (ele já sabe o clube).
+      const holeCardsById = {};
+      contenders.forEach((p) => { holeCardsById[p.id] = p.cards; });
+      this.pendingJackpotEvent = detectJackpotEvent(scored, contenders.map((p) => p.id), holeCardsById, this.variant);
+      this.pendingJackpotDealtIds = Object.keys(this.handStartChips || {});
       // As 5 cartas exatas que formaram a mão de quem ganhou algum pote —
       // pra UI acender um brilho só nelas (nas cartas na mão do jogador E
       // no board), igual pedido: "mostre a animação das cartas usadas

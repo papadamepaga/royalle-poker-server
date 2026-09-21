@@ -251,6 +251,11 @@ export async function migrate() {
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_enabled BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_rake_percent INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_balance BIGINT NOT NULL DEFAULT 0;`);
+  // Tipo de jackpot (mixed/cooler/cooler_plus) e como a taxa é cobrada
+  // (per_hand/per_pot) — igual a tela "Configurações de Jackpot" do
+  // pppoker que o Carlos mandou de referência.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_type TEXT NOT NULL DEFAULT 'mixed';`);
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS jackpot_fee_mode TEXT NOT NULL DEFAULT 'per_pot';`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_entries (
       id SERIAL PRIMARY KEY,

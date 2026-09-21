@@ -657,6 +657,7 @@ function broadcastTable(code) {
     send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0) } });
   }
   maybeRecordRake(rt, code);
+  maybeAwardJackpot(rt, code);
   maybeRecordHandLedger(rt, code);
   if (table.needsAutoRunout()) {
     // Quando todo mundo já está all-in (ninguém mais decide nada), as
@@ -715,6 +716,99 @@ async function maybeRecordRake(rt, code) {
     // hora, sem precisar sair e entrar de novo no clube.
     if (rt.clubCode) await broadcastClub(rt.clubCode);
   }
+}
+
+// Espelha (server-side) as mesmas tabelas de premiação que aparecem nos
+// popups "?" da tela de configuração — mesma fonte (documentação oficial
+// que o Carlos mandou), só reorganizada por variante pra ser fácil de
+// consultar aqui. Cooler/Cooler Plus não pagam Mão Forte (não existe essa
+// seção nos dois documentos deles); só o Mixed paga os dois.
+const JACKPOT_COOLER_PCT = {
+  mixed:       { holdem: { quads: 50, straightflush: 80 }, plo4: { quads: 33, straightflush: 52 }, plo5: { quads: 23, straightflush: 36 }, plo6: { quads: 13, straightflush: 20 } },
+  cooler:      { holdem: { quads: 65, straightflush: 90 }, plo4: { quads: 46, straightflush: 63 }, plo5: { quads: 33, straightflush: 45 }, plo6: { quads: 20, straightflush: 27 } },
+  cooler_plus: { holdem: { quads: 65, straightflush: 90 }, plo4: { quads: 46, straightflush: 63 }, plo5: { quads: 33, straightflush: 45 }, plo6: { quads: 20, straightflush: 27 } },
+};
+const JACKPOT_STRONG_PCT = {
+  mixed: { holdem: { quads: 1, straightflush: 4, royal: 14 }, plo4: { straightflush: 1.2, royal: 4.2 }, plo5: { straightflush: 0.8, royal: 2.8 } },
+};
+
+// Paga de verdade um Cooler/Mão Forte detectado na última mão dessa
+// mesa — independe de ter havido rake (por isso roda fora do `if` do
+// maybeRecordRake). Só mexe em fichas de quem ainda está sentado; quem
+// já saiu da mesa perde a parte (a regra também diz isso: "jogadores
+// que deixarem a mesa antes do fim da mão não se qualificam").
+async function maybeAwardJackpot(rt, code) {
+  const event = rt.table?.pendingJackpotEvent;
+  const dealtIds = rt.table?.pendingJackpotDealtIds || [];
+  if (!event) return;
+  rt.table.pendingJackpotEvent = null;
+  rt.table.pendingJackpotDealtIds = [];
+  if (!rt.clubId) return;
+  const club = await getClubById(rt.clubId);
+  if (!club?.jackpot_enabled) return;
+  const type = club.jackpot_type || "mixed";
+  if (event.kind === "cooler" && dealtIds.length < 3) return; // "pelo menos 3 jogadores devem receber uma mão"
+  if (event.kind === "strong" && type !== "mixed") return; // Cooler/Cooler Plus não pagam Mão Forte
+
+  const variant = rt.table.variant;
+  const pctTable = event.kind === "cooler" ? JACKPOT_COOLER_PCT[type]?.[variant] : JACKPOT_STRONG_PCT[type]?.[variant];
+  // No Cooler, a coluna certa da tabela depende do que a mão PERDEDORA
+  // era (Full House de valetes+ não tem % nas tabelas — fica de fora,
+  // igual o "—" nos documentos).
+  const key = event.kind === "cooler"
+    ? (event.loserCategory >= 8 ? "straightflush" : event.loserCategory === 7 ? "quads" : null)
+    : event.trigger;
+  const pct = pctTable?.[key];
+  if (!pct) return;
+
+  const jackpotBalance = Number(club.jackpot_balance || 0);
+  const prize = Math.floor((jackpotBalance * pct) / 100);
+  if (prize <= 0) return;
+
+  const others = dealtIds.filter((id) => id !== event.winnerId && id !== event.loserId);
+  const shares = {}; // playerId -> fichas
+  if (event.kind === "cooler") {
+    if (others.length === 0) {
+      shares[event.winnerId] = Math.round(prize * 0.4);
+      shares[event.loserId] = prize - shares[event.winnerId];
+    } else {
+      shares[event.winnerId] = Math.round(prize * 0.3);
+      shares[event.loserId] = Math.round(prize * 0.5);
+      const othersTotal = prize - shares[event.winnerId] - shares[event.loserId];
+      const per = Math.floor(othersTotal / others.length);
+      let rem = othersTotal - per * others.length;
+      others.forEach((id) => { shares[id] = per + (rem > 0 ? 1 : 0); if (rem > 0) rem--; });
+    }
+  } else {
+    if (others.length === 0) {
+      shares[event.winnerId] = prize;
+    } else {
+      shares[event.winnerId] = Math.round(prize * 0.8);
+      const othersTotal = prize - shares[event.winnerId];
+      const per = Math.floor(othersTotal / others.length);
+      let rem = othersTotal - per * others.length;
+      others.forEach((id) => { shares[id] = per + (rem > 0 ? 1 : 0); if (rem > 0) rem--; });
+    }
+  }
+
+  // Só credita quem ainda está sentado na mesa — o resto (quem já
+  // levantou) fica de fora do que efetivamente sai do pote, mesmo tendo
+  // "direito" na regra, porque não tem onde depositar a ficha.
+  let actuallyPaid = 0;
+  for (const [id, amount] of Object.entries(shares)) {
+    if (!(amount > 0)) continue;
+    const player = rt.table.players.find((p) => p.id === id);
+    if (!player) continue;
+    player.chips += amount;
+    actuallyPaid += amount;
+  }
+  if (actuallyPaid <= 0) return;
+
+  rt.jackpotBalance = await addJackpotChips(rt.clubId, -actuallyPaid);
+  const label = event.kind === "cooler" ? "Jackpot Cooler" : "Jackpot Mão Forte";
+  rt.table.addLog?.(`${label}! ${actuallyPaid.toLocaleString("pt-BR")} fichas distribuídas do pote.`);
+  broadcastTable(code);
+  if (rt.clubCode) await broadcastClub(rt.clubCode);
 }
 
 // Carreira: só mesas de CLUBE contam (fichas fictícias de "Jogar" fora de
@@ -777,7 +871,7 @@ function publicClub(club, viewerIsOwner, extra = {}) {
   // dono/admin recebe esses campos. Pra membro comum, nem chegam a existir
   // no payload (não é só esconder na interface).
   if (viewerIsOwner) {
-    return { ...base, treasuryChips: Number(club.treasury_chips), totalRake: extra.totalRake ?? 0, platformRake: extra.platformRake ?? 0, jackpotRakePercent: Number(club.jackpot_rake_percent || 0) };
+    return { ...base, treasuryChips: Number(club.treasury_chips), totalRake: extra.totalRake ?? 0, platformRake: extra.platformRake ?? 0, jackpotRakePercent: Number(club.jackpot_rake_percent || 0), jackpotType: club.jackpot_type || "mixed", jackpotFeeMode: club.jackpot_fee_mode || "per_pot" };
   }
   return base;
 }
@@ -992,7 +1086,7 @@ async function handleMessage(ws, msg, ctx) {
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
     const me = await getMember(club.id, ws.userId);
     if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Só o dono ou um gestor pode mexer no jackpot." });
-    await setJackpotConfig(club.id, { enabled: !!msg.enabled, rakePercent: msg.rakePercent });
+    await setJackpotConfig(club.id, { enabled: !!msg.enabled, type: msg.type, feeMode: msg.feeMode });
     ctx.reply({ ok: true });
     await broadcastClub(club.code);
     refreshJackpotOnRuntimes(club.id);
