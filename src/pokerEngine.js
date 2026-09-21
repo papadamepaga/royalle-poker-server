@@ -289,11 +289,48 @@ function computeWinProbs(contenders, community, variant) {
   return probs;
 }
 
+// Igual computeWinProbs, mas devolve a fração exata (não arredondada em
+// %) de cada contendor — usado só pelo "Dividir EV", onde arredondar
+// pra porcentagem inteira faria a soma dos pagamentos não bater com o
+// pote exato.
+function computeEquityFractions(contenders, community, variant, trials = 500) {
+  const eq = {};
+  if (contenders.length < 1) return eq;
+  if (contenders.length === 1) { eq[contenders[0].id] = 1; return eq; }
+  const known = new Set();
+  contenders.forEach((p) => p.cards.forEach((c) => known.add(c.rank + c.suit)));
+  community.forEach((c) => known.add(c.rank + c.suit));
+  const remaining = freshDeck().filter((c) => !known.has(c.rank + c.suit));
+  const needed = Math.max(0, 5 - community.length);
+  const wins = {};
+  contenders.forEach((p) => (wins[p.id] = 0));
+  for (let t = 0; t < trials; t++) {
+    const pool = shuffle(remaining);
+    const runout = [...community, ...pool.slice(0, needed)];
+    let best = null, winners = [];
+    contenders.forEach((p) => {
+      const s = bestHandFor(p.cards, runout, variant);
+      if (!best || compareScores(s, best) > 0) { best = s; winners = [p.id]; }
+      else if (compareScores(s, best) === 0) winners.push(p.id);
+    });
+    winners.forEach((id) => (wins[id] += 1 / winners.length));
+  }
+  contenders.forEach((p) => { eq[p.id] = wins[p.id] / trials; });
+  return eq;
+}
+
 export class PokerTable {
-  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0, variant = "holdem", maxSeats = 9 } = {}) {
+  constructor({ smallBlind = 25, bigBlind = 50, rakePercent = 0, variant = "holdem", maxSeats = 9, rakeCapBb = 3, actionSeconds = 30, revealFoldedCards = true, seeInAction = false, straddleEnabled = false, runItMultiple = false, splitEv = false } = {}) {
     this.smallBlind = smallBlind;
     this.bigBlind = bigBlind;
     this.rakePercent = rakePercent; // e.g. 5 means 5% of each pot
+    this.rakeCapBb = rakeCapBb; // "Teto" da tela de criar mesa — nunca tira mais que isso (em BB) de um pote só
+    this.actionSeconds = actionSeconds; // "Tempo de ação" configurável por mesa
+    this.revealFoldedCards = revealFoldedCards; // "Ver Cartas Descartadas" da tela de criar mesa
+    this.seeInAction = seeInAction; // "Ver em ação"
+    this.straddleEnabled = straddleEnabled; // "Straddle UTG automático"
+    this.runItMultiple = runItMultiple; // "Bater duas vezes"
+    this.splitEv = splitEv; // "Dividir EV"
     this.variant = variant; // "holdem" | "plo4" | "plo5" | "plo6" (só holdem implementado por enquanto)
     // Quantidade de assentos físicos ao redor da mesa — fixo desde a
     // criação, independe de quantos estão sentados agora. É o que deixa
@@ -400,7 +437,7 @@ export class PokerTable {
     // referência pra calcular ganho/perda líquido dessa mão (usado na
     // Carreira). Guardamos só de quem realmente vai jogar.
     this.handStartChips = {};
-    this.players.forEach((p) => { if (p.chips > 0) this.handStartChips[p.id] = p.chips; });
+    this.players.forEach((p) => { if (p.chips > 0) { this.handStartChips[p.id] = p.chips; p.vpipThisHand = false; p.sawOwnTurnThisHand = false; } });
     this.lastHandDeltas = null;
     this.players.forEach((p) => {
       p.cards = []; p.folded = false; p.allIn = false; p.inHand = p.chips > 0; p.roundBet = 0; p.totalBet = 0;
@@ -431,7 +468,29 @@ export class PokerTable {
     this.winProbs = {};
     this.winningHandCards = {};
 
-    const firstActor = nextToActSeat(this.players, bbIdx);
+    let firstActorSeatForQueue = bbIdx;
+    // Straddle UTG automático: com 4+ jogadores na mão, o UTG (primeiro
+    // a agir depois do BB) entra automaticamente com uma aposta forçada
+    // de 2x o big blind, ANTES de qualquer carta ser olhada — igual uma
+    // raise "as cegas". currentBet e minRaise sobem juntos, e a ação
+    // começa depois dele (ele mantém a opção de re-agir quando a rodada
+    // voltar pra ele, mesma lógica que o BB já tem hoje sem straddle).
+    if (this.straddleEnabled && playing >= 4) {
+      const utgIdx = nextToActSeat(this.players, bbIdx);
+      if (utgIdx !== -1) {
+        const utg = this.players[utgIdx];
+        const straddleAmt = Math.min(this.bigBlind * 2, utg.chips);
+        utg.chips -= straddleAmt; utg.roundBet = straddleAmt; utg.totalBet += straddleAmt;
+        if (utg.chips === 0) utg.allIn = true;
+        this.pot += straddleAmt;
+        this.currentBet = straddleAmt;
+        this.minRaise = Math.max(this.bigBlind, straddleAmt - this.bigBlind);
+        this.addLog(`${utg.name} paga o straddle automático (${straddleAmt}).`);
+        firstActorSeatForQueue = utgIdx;
+      }
+    }
+
+    const firstActor = nextToActSeat(this.players, firstActorSeatForQueue);
     this.toActQueue = firstActor === -1 ? [] : this.buildActOrder(firstActor);
     this.actingId = this.toActQueue[0] ?? null;
     this.addLog(`Nova mão. ${sb.name} paga small blind (${sbAmt}), ${bb.name} paga big blind (${bbAmt}).`);
@@ -446,6 +505,13 @@ export class PokerTable {
     p.away = false;
 
     let raiseHappened = false;
+    // VPIP ("Voluntarily Put money In Pot") — só conta call/raise/all-in
+    // no PRÉ-flop que não seja só completar o que o blind forçado já
+    // cobria (checar não conta, e pagar 0 de verdade — currentBet igual
+    // ao que já tinha — também não). Usado pela regra "Nv. de VPIP".
+    if (this.stage === "preflop" && (action === "call" || action === "raise" || action === "allin") && this.currentBet > p.roundBet) {
+      p.vpipThisHand = true;
+    }
     if (action === "fold") { p.folded = true; this.addLog(`${p.name} desiste.`); }
     else if (action === "check") {
       if (this.currentBet - p.roundBet > 0) return { error: "Não dá pra passar, tem aposta na mesa." };
@@ -621,7 +687,10 @@ export class PokerTable {
         // showdown (not everyone-folds-preflop) get raked, and the rake
         // is taken off the top before splitting among winners. Todo o
         // rake é do CLUBE — não existe mais fatia pro app.
-        const rakeAmount = this.rakePercent > 0 ? Math.floor((potObj.amount * this.rakePercent) / 100) : 0;
+        // "Teto" da tela de criar mesa: por mais que o % dê um valor
+        // maior, nunca tira mais que rakeCapBb big blinds desse pote.
+        const rakeCapChips = this.rakeCapBb > 0 ? Math.floor(this.rakeCapBb * this.bigBlind) : Infinity;
+        const rakeAmount = this.rakePercent > 0 ? Math.min(Math.floor((potObj.amount * this.rakePercent) / 100), rakeCapChips) : 0;
         const distributable = potObj.amount - rakeAmount;
         this.pendingRake += rakeAmount;
         if (rakeAmount > 0) {
@@ -660,11 +729,16 @@ export class PokerTable {
     // Ganho/perda líquido de cada jogador que começou a mão, pra
     // alimentar a Carreira (só quem tinha fichas registradas no início).
     this.lastHandDeltas = {};
+    // Snapshot de VPIP dessa mão — pra "Nv. de VPIP" poder contar mãos
+    // jogadas mesmo pra quem desistiu sem nunca pagar nada (não conta
+    // VPIP), e pro dono decidir remover quem tá jogando apertado demais.
+    this.lastHandVpip = {};
     Object.keys(this.handStartChips || {}).forEach((id) => {
       const p = this.players.find((pl) => pl.id === id);
       if (!p) return;
       const delta = p.chips - this.handStartChips[id];
       if (delta !== 0) this.lastHandDeltas[id] = delta;
+      this.lastHandVpip[id] = !!p.vpipThisHand;
     });
     this.recordHandHistorySnapshot(contenders);
   }
@@ -693,7 +767,11 @@ export class PokerTable {
       return {
         id, name: p ? p.name : id,
         position: offset != null ? posName(offset) : null,
-        cards: contenderIds.has(id) ? (p ? p.cards : null) : null,
+        // "Ver Cartas Descartadas": mesa configurada pra revelar as
+        // cartas de quem desistiu, mas só DEPOIS da mão acabar (aqui é
+        // sempre pós-mão) — nunca durante o jogo, isso vazaria
+        // informação viva. Quando desligado, comportamento de sempre.
+        cards: contenderIds.has(id) ? (p ? p.cards : null) : (this.revealFoldedCards && p ? p.cards : null),
         handLabel: contenderIds.has(id) && p ? (CATEGORY_NAMES[bestHandFor(p.cards, this.community, this.variant)?.category] || null) : null,
         delta: this.lastHandDeltas[id] || 0,
       };
@@ -709,6 +787,67 @@ export class PokerTable {
     if (this.handHistory.length > 50) this.handHistory.length = 50;
   }
 
+  // "Dividir EV": se der pra oferecer o chop (ver eligibleForSplitEv),
+  // resolve a mão AGORA por equidade em vez de continuar revelando
+  // cartas — cada jogador recebe a fatia de cada pote proporcional à
+  // sua chance de ganhar, sem depender de qual carta sai depois. É uma
+  // resolução PRÓPRIA (não usa resolveShowdownOrFold) justamente pra não
+  // arriscar misturar dois jeitos diferentes de fechar pote na mesma
+  // função — mais fácil de revisar separado.
+  eligibleForSplitEv() {
+    if (!this.splitEv) return false;
+    if (this.stage === "idle" || this.stage === "showdown" || this.community.length >= 5) return false;
+    const live = this.players.filter((p) => p.inHand && !p.folded);
+    if (live.length < 2) return false;
+    if (!live.every((p) => p.allIn || p.chips === 0)) return false;
+    const potTotal = this.players.reduce((s, p) => s + p.totalBet, 0);
+    return potTotal >= 10 * this.bigBlind;
+  }
+
+  settleBySplitEv() {
+    const live = this.players.filter((p) => p.inHand && !p.folded);
+    const pots = computePots(this.players);
+    const tags = {};
+    pots.forEach((potObj) => {
+      const eligible = live.filter((p) => potObj.eligible.includes(p.id));
+      if (eligible.length === 0) return;
+      // Taxa própria do Dividir EV: 3% do pote, igual a fórmula do
+      // documento (Pot - Taxa) × Equidade × 97% — aqui já aplicada como
+      // um fator direto no valor total antes de repartir.
+      const distributable = Math.floor(potObj.amount * 0.97);
+      if (eligible.length === 1) {
+        eligible[0].chips += distributable;
+        tags[eligible[0].id] = (tags[eligible[0].id] || 0) + distributable;
+        return;
+      }
+      const eq = computeEquityFractions(eligible, this.community, this.variant);
+      let given = 0;
+      eligible.forEach((p, i) => {
+        const isLast = i === eligible.length - 1;
+        const share = isLast ? (distributable - given) : Math.floor(distributable * (eq[p.id] || 0));
+        p.chips += share;
+        given += share;
+        tags[p.id] = (tags[p.id] || 0) + share;
+      });
+    });
+    this.results = Object.fromEntries(Object.entries(tags).map(([id, amt]) => [id, `+${amt} (EV)`]));
+    this.addLog("Dividir EV: pote resolvido por equidade, sem esperar o resto do board.");
+    this.lastHandDeltas = {};
+    this.lastHandVpip = {};
+    Object.keys(this.handStartChips || {}).forEach((id) => {
+      const p = this.players.find((pl) => pl.id === id);
+      if (!p) return;
+      const delta = p.chips - this.handStartChips[id];
+      if (delta !== 0) this.lastHandDeltas[id] = delta;
+      this.lastHandVpip[id] = !!p.vpipThisHand;
+    });
+    this.recordHandHistorySnapshot(live);
+    this.actingId = null;
+    this.toActQueue = [];
+    this.stage = "showdown"; // mesma pausa visual de sempre antes da próxima mão
+    this.allInRunout = false;
+  }
+
   needsAutoRunout() {
     if (this.actingId !== null) return false;
     // "river" faltava aqui — sem ele, uma mão que vai all-in cedo (todo
@@ -720,6 +859,10 @@ export class PokerTable {
 
   // Public view: hides other players' hole cards unless it's showdown.
   getPublicState(forPlayerId) {
+    if (this.seeInAction) {
+      if (!this._seenCards) this._seenCards = new Set();
+      if (this.actingId) this._seenCards.add(this.actingId);
+    }
     const cfg = variantConfig(this.variant);
     return {
       stage: this.stage,
@@ -763,6 +906,7 @@ export class PokerTable {
       bigBlind: this.bigBlind,
       variant: this.variant,
       maxSeats: this.maxSeats,
+      actionSeconds: this.actionSeconds,
       // Pra UI saber quantas cartas mostrar antes de distribuir e se deve
       // aplicar o teto de Pot-Limit no slider — sem precisar hardcodar
       // "PLO4/5/6" em lugar nenhum do cliente também.
@@ -776,7 +920,14 @@ export class PokerTable {
       players: this.players.map((p) => {
         // Cartas ficam visíveis pro dono delas sempre, e pra todo mundo
         // durante all-in runout ou showdown (mesma regra de uma mesa real).
-        const cardsVisible = p.id === forPlayerId || ((this.stage === "showdown" || this.allInRunout) && !p.folded);
+        // "Ver em ação" muda só a parte do DONO: fica escondida até
+        // chegar a vez dele de jogar (this._seenCards é marcado logo
+        // abaixo, toda vez que getPublicState roda com alguém agindo —
+        // uma vez visto, continua visível o resto da mão, mesma lógica
+        // de "já vi minhas cartas, não vou esquecer").
+        const ownCardsHidden = this.seeInAction && this.stage !== "idle" && this.stage !== "showdown" && !this.allInRunout
+          && p.id !== this.actingId && !this._seenCards?.has(p.id) && !p.folded;
+        const cardsVisible = (p.id === forPlayerId && !ownCardsHidden) || ((this.stage === "showdown" || this.allInRunout) && !p.folded);
         const cards = cardsVisible ? p.cards : p.cards.map(() => null);
         // "Par", "Flush" etc ao lado do jogador — só calculado quando as
         // cartas dele já estão visíveis pra quem está olhando, e só a

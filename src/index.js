@@ -20,7 +20,7 @@ import {
   getOrCreateQuickWallet, adjustQuickWalletChips, adjustQuickWalletGems, claimDailyBonus,
   updateUserAvatar, getUserStats, recordHandStat,
   updateUserAvatarImage, renameUser, setNickname, updateClubImage, updateClubCoverImage, setClubLevel, setMemberRole,
-  listClubTables, createClubTable, getClubTableById, updateClubTable, deleteClubTable,
+  listClubTables, createClubTable, getClubTableById, updateClubTable, deleteClubTable, getTablePlayerStats, bumpTablePlayerStats,
   recordPayLedger, getPayHistory,
   createJoinRequest, hasJoinRequest, listJoinRequests, removeJoinRequest, getJoinRequestAgent,
   createAnnouncement, getLatestAnnouncement, listAnnouncements,
@@ -420,7 +420,7 @@ async function pulseTournamentTable(code) {
 // tolerância (o cliente mostra isso como "acabou, +10s"). Estourado
 // isso, age por ele — passa se der de graça, senão desiste e marca
 // "ausente" na mesa (fica assim até ele mesmo agir nela de novo).
-const ACTION_TIMEOUT_MS = 40000;
+const ACTION_GRACE_MS = 10000; // +10s de tolerância depois do "Tempo de ação" configurado da mesa
 function tickActionTimeouts() {
   const now = Date.now();
   for (const [code, rt] of runtime.entries()) {
@@ -433,7 +433,8 @@ function tickActionTimeouts() {
       rt._actingSince = now;
       continue;
     }
-    if (now - (rt._actingSince || now) >= ACTION_TIMEOUT_MS) {
+    const timeoutMs = (Number(table.actionSeconds) || 30) * 1000 + ACTION_GRACE_MS;
+    if (now - (rt._actingSince || now) >= timeoutMs) {
       table.autoTimeoutAction(table.actingId);
       rt._lastActingId = table.actingId; // pode já ser o próximo jogador
       rt._actingSince = now;
@@ -477,6 +478,59 @@ async function tickTournaments() {
       console.error(`Erro processando torneio #${t.id}:`, err.message);
     }
   }
+}
+
+// "Duração da mesa" + "Extensão automática" — só arma o relógio na
+// primeira vez que a mesa é criada de verdade (rt.table === null antes
+// dessa chamada); reconectar ou outra pessoa sentar depois não reseta o
+// prazo. duration_minutes=0 quer dizer sem limite (não arma nada).
+function setupTableDuration(rt, t) {
+  if (rt.tableClosesAt !== undefined) return; // já armado antes, não pisa em cima
+  const minutes = Number(t.duration_minutes) || 0;
+  rt.tableClosesAt = minutes > 0 ? Date.now() + minutes * 60000 : null;
+  rt.tableAutoExtend = !!t.auto_extend;
+  rt.tableExtendsLeft = Number(t.auto_extend_times) || 0;
+}
+
+// Roda periodicamente: mesa de clube com prazo vencido fecha (todo
+// mundo recebe as fichas de volta no Royalle Pay) a menos que a
+// Extensão automática esteja ligada, ainda tenha "vezes" sobrando, e a
+// mesa tenha pelo menos 2 jogadores — aí soma mais 1h e desconta uma
+// extensão, igual a regra descrita.
+async function tickTableDurations() {
+  const now = Date.now();
+  for (const [code, rt] of runtime.entries()) {
+    if (!rt.tableClosesAt || now < rt.tableClosesAt || !rt.table) continue;
+    if (rt.tableAutoExtend && rt.tableExtendsLeft > 0 && rt.table.players.length >= 2) {
+      rt.tableClosesAt = now + 60 * 60000;
+      rt.tableExtendsLeft -= 1;
+      rt.table.addLog?.(`Mesa estendida automaticamente por mais 1h (${rt.tableExtendsLeft} extensão(ões) restante(s)).`);
+      broadcastTable(code);
+      continue;
+    }
+    // Fecha de vez: devolve fichas de quem estiver sentado e desliga o
+    // prazo (não fecha de novo sozinha depois disso).
+    if (rt.clubId) {
+      for (const p of [...rt.table.players]) {
+        const user = await findUserByUsername(p.id);
+        if (user) await adjustMemberChips(rt.clubId, user.id, p.chips);
+      }
+    }
+    rt.table.players = [];
+    rt.tableClosesAt = null;
+    rt.table.addLog?.("A mesa encerrou — duração configurada terminou.");
+    broadcastTable(code);
+  }
+}
+
+// Distância em metros entre duas coordenadas — fórmula de haversine,
+// usada só pela "Restrição de GPS".
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
 }
 
 function ensureQuickRuntime(code, variant, tierIndex) {
@@ -654,12 +708,22 @@ function broadcastTable(code) {
   const table = rt?.table;
   if (!table) return;
   for (const [ws, username] of rt.socketToPlayer.entries()) {
-    send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0) } });
+    send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0), autoStart: rt.autoStart !== false, minStartPlayers: rt.minStartPlayers || 2, chatBanned: !!rt.chatBanned } });
   }
   maybeRecordRake(rt, code);
   maybeAwardJackpot(rt, code);
+  maybeUpdateTablePlayerStats(rt, code);
   maybeRecordHandLedger(rt, code);
-  if (table.needsAutoRunout()) {
+  if (table.eligibleForSplitEv()) {
+    // Só oferece nos 900ms normais de decisão entre ruas (mesmo delay
+    // do runout automático) — dá um instante pra UI mostrar a % antes
+    // de já fechar por equidade.
+    setTimeout(() => {
+      if (rt.table !== table || !table.eligibleForSplitEv()) return;
+      table.settleBySplitEv();
+      broadcastTable(code);
+    }, 900);
+  } else if (table.needsAutoRunout()) {
     // Quando todo mundo já está all-in (ninguém mais decide nada), as
     // cartas saem bem mais devagar — dá tempo de ver a mão revelada e a %
     // de vitória antes da próxima carta, em vez de tudo bater junto.
@@ -833,6 +897,42 @@ async function maybeRecordHandLedger(rt, code) {
   for (const [playerId, delta] of Object.entries(deltas)) {
     const user = await findUserByUsername(playerId);
     if (user) await recordHandLedger(rt.clubId, tableId, user.id, delta);
+  }
+}
+
+// VPIP ("Nv. de VPIP") e lucro de sessão (pro "Tempo decretado") —
+// atualiza um por um a cada mão resolvida. Só mesa de clube de verdade
+// (fichas reais), igual o resto do sistema de estatística.
+async function maybeUpdateTablePlayerStats(rt, code) {
+  const vpipMap = rt.table?.lastHandVpip;
+  if (!vpipMap || rt.isQuick || rt.isTournament || !rt.clubId) { if (vpipMap) rt.table.lastHandVpip = null; return; }
+  rt.table.lastHandVpip = null;
+  const deltas = rt.table?.lastHandDeltas || {};
+  const tableId = code.includes("#") ? Number(code.split("#")[1]) : null;
+  if (!tableId) return;
+  const t = await getClubTableById(rt.clubId, tableId);
+  for (const [playerId, vpip] of Object.entries(vpipMap)) {
+    const user = await findUserByUsername(playerId);
+    if (!user) continue;
+    const stats = await bumpTablePlayerStats(tableId, user.id, { vpip, profitDelta: deltas[playerId] || 0 });
+    // "Nv. de VPIP": depois de rodar o limite de mãos configurado, quem
+    // tá jogando MAIS apertado que o mínimo exigido é removido da mesa
+    // (a regra é "abaixo do nível exigido é removido" — não é castigo
+    // por jogar solto demais, é o contrário: exige um mínimo de VPIP).
+    const flags = t?.advanced_flags || {};
+    const vpipLevel = Number(flags.vpipLevelPct || 0);
+    const vpipHandLimit = Number(flags.vpipHandLimit || 30);
+    if (flags.vpipLevel && vpipLevel > 0 && stats.hands_played >= vpipHandLimit) {
+      const pct = (stats.hands_vpip / stats.hands_played) * 100;
+      if (pct < vpipLevel) {
+        const p = rt.table?.players?.find((pl) => pl.id === playerId);
+        if (p && !p.away) {
+          rt.table.players = rt.table.players.filter((pl) => pl.id !== playerId);
+          rt.table.addLog?.(`${p.name} foi removido da mesa por VPIP abaixo do exigido.`);
+          await adjustMemberChips(rt.clubId, user.id, p.chips);
+        }
+      }
+    }
   }
 }
 
@@ -1087,7 +1187,13 @@ async function handleMessage(ws, msg, ctx) {
     const me = await getMember(club.id, ws.userId);
     if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Só o dono ou um gestor pode mexer no jackpot." });
     await setJackpotConfig(club.id, { enabled: !!msg.enabled, type: msg.type, feeMode: msg.feeMode });
-    ctx.reply({ ok: true });
+    const fresh = await getClubById(club.id);
+    // Devolve os campos atualizados na hora, na própria resposta — o
+    // broadcastClub só alcança quem já tá com uma mesa desse clube
+    // aberta (é indexado por runtime, não por "tá vendo o clube"), então
+    // sozinho ele NÃO acorda a tela de Admin de quem acabou de mexer
+    // no toggle. É por isso que ligar o jackpot não "pegava" antes.
+    ctx.reply({ ok: true, jackpotEnabled: !!fresh.jackpot_enabled, jackpotBalance: Number(fresh.jackpot_balance || 0), jackpotType: fresh.jackpot_type, jackpotFeeMode: fresh.jackpot_fee_mode, jackpotRakePercent: Number(fresh.jackpot_rake_percent || 0) });
     await broadcastClub(club.code);
     refreshJackpotOnRuntimes(club.id);
     return;
@@ -1105,8 +1211,9 @@ async function handleMessage(ws, msg, ctx) {
     if (amount <= 0) return ctx.reply({ ok: false, error: "Quantidade inválida." });
     if (Number(club.treasury_chips) < amount) return ctx.reply({ ok: false, error: "Saldo do clube insuficiente." });
     await adjustClubTreasury(club.id, -amount);
-    await addJackpotChips(club.id, amount);
-    ctx.reply({ ok: true });
+    const newBalance = await addJackpotChips(club.id, amount);
+    const freshClub = await getClubById(club.id);
+    ctx.reply({ ok: true, jackpotBalance: newBalance, treasuryChips: Number(freshClub.treasury_chips) });
     await broadcastClub(club.code);
     refreshJackpotOnRuntimes(club.id);
     return;
@@ -1358,7 +1465,7 @@ async function handleMessage(ws, msg, ctx) {
       members: membersForViewer(members, ws.username, viewerIsOwner),
       weeklyRake,
     });
-    if (rt.table) send(ws, { type: "table_state", state: { ...rt.table.getPublicState(ws.username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0) } });
+    if (rt.table) send(ws, { type: "table_state", state: { ...rt.table.getPublicState(ws.username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0), autoStart: rt.autoStart !== false, minStartPlayers: rt.minStartPlayers || 2, chatBanned: !!rt.chatBanned } });
     return;
   }
 
@@ -1497,14 +1604,27 @@ async function handleMessage(ws, msg, ctx) {
     if (!requireAuth(ws, ctx)) return;
     const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const me = await getMember(club.id, ws.userId);
+    const viewerIsOwner = me?.role === "owner" || me?.role === "agent";
     const tables = await ensureDefaultClubTable(club);
     ctx.reply({
       ok: true,
-      tables: tables.map((t) => {
-        const players = runtime.get(`${club.code}#${t.id}`)?.table?.players || [];
+      tables: tables
+        // "Mesa exclusiva" some da lista pra quem não é dono/gestor —
+        // é assim que uma mesa convite-only funciona de verdade, não só
+        // uma etiqueta visual.
+        .filter((t) => !t.exclusive || viewerIsOwner)
+        .map((t) => {
+        const trt = runtime.get(`${club.code}#${t.id}`);
+        const players = trt?.table?.players || [];
         return {
-          id: t.id, variant: t.variant, smallBlind: t.small_blind, bigBlind: t.big_blind,
-          buyIn: t.buy_in, rakePercent: Number(t.rake_percent), maxPlayers: t.max_players,
+          pendingBuyinCount: viewerIsOwner ? (trt?.pendingBuyins?.length || 0) : 0,
+          id: t.id, name: t.name || null, variant: t.variant, smallBlind: t.small_blind, bigBlind: t.big_blind,
+          buyIn: t.buy_in, maxBuyIn: t.max_buy_in ?? null, rakePercent: Number(t.rake_percent), maxPlayers: t.max_players,
+          actionSeconds: t.action_seconds, durationMinutes: t.duration_minutes, autoExtend: t.auto_extend, autoExtendTimes: t.auto_extend_times,
+          autoStart: t.auto_start, minStartPlayers: t.min_start_players, rakeCapBb: Number(t.rake_cap_bb),
+          exclusive: !!t.exclusive, buyinRequiresApproval: !!t.buyin_requires_approval, chatBanned: !!t.chat_banned,
+          showFoldedCards: t.show_folded_cards !== false, seeInAction: !!t.see_in_action, advancedFlags: t.advanced_flags || {},
           playersNow: players.length,
           // Pra tela de prévia da mesa (quem tá jogando) e pra saber se o
           // próprio jogador já está sentado ali (mostra "voltar a jogar"
@@ -1516,6 +1636,29 @@ async function handleMessage(ws, msg, ctx) {
       }),
     });
     return;
+  }
+
+  // Lê e valida tudo que a tela "Criar mesa" manda além do básico
+  // (blinds/buy-in/rake/max) — compartilhado entre criar e editar pra
+  // não duplicar a validação.
+  function parseAdvancedTableFields(msg) {
+    return {
+      name: (msg.name || "").trim().slice(0, 40) || null,
+      actionSeconds: Math.min(60, Math.max(5, Number(msg.actionSeconds) || 30)),
+      maxBuyIn: msg.maxBuyIn != null ? Math.max(0, Number(msg.maxBuyIn) || 0) : null,
+      durationMinutes: Math.max(0, Number(msg.durationMinutes) || 0),
+      autoExtend: !!msg.autoExtend,
+      autoExtendTimes: Math.max(0, Math.min(50, Number(msg.autoExtendTimes) || 0)),
+      autoStart: msg.autoStart !== false,
+      minStartPlayers: Math.max(2, Math.min(9, Number(msg.minStartPlayers) || 2)),
+      rakeCapBb: Math.max(0, Math.min(20, Number(msg.rakeCapBb) || 3)),
+      exclusive: !!msg.exclusive,
+      buyinRequiresApproval: !!msg.buyinRequiresApproval,
+      chatBanned: !!msg.chatBanned,
+      showFoldedCards: msg.showFoldedCards !== false,
+      seeInAction: !!msg.seeInAction,
+      advancedFlags: msg.advancedFlags && typeof msg.advancedFlags === "object" ? msg.advancedFlags : {},
+    };
   }
 
   if (type === "create_club_table") {
@@ -1533,7 +1676,7 @@ async function handleMessage(ws, msg, ctx) {
       return ctx.reply({ ok: false, error: "Blinds/buy-in inválidos." });
     }
     await ensureDefaultClubTable(club); // garante migração antes de adicionar mais uma
-    const t = await createClubTable({ clubId: club.id, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers });
+    const t = await createClubTable({ clubId: club.id, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers, ...parseAdvancedTableFields(msg) });
     ctx.reply({ ok: true, tableId: t.id });
     return;
   }
@@ -1558,7 +1701,7 @@ async function handleMessage(ws, msg, ctx) {
     if (runtime.get(runtimeCode)?.table?.players?.length > 0) {
       return ctx.reply({ ok: false, error: "Não dá pra editar uma mesa com jogadores sentados." });
     }
-    await updateClubTable(club.id, existing.id, { variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers });
+    await updateClubTable(club.id, existing.id, { variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers, ...parseAdvancedTableFields(msg) });
     ctx.reply({ ok: true });
     return;
   }
@@ -1826,14 +1969,29 @@ async function handleMessage(ws, msg, ctx) {
     if (!t) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
     const code = `${club.code}#${t.id}`;
     const rt = ensureRuntime(code, club.id);
-    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
+    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players, rakeCapBb: Number(t.rake_cap_bb ?? 3), actionSeconds: t.action_seconds || 30, revealFoldedCards: t.show_folded_cards !== false,
+      seeInAction: !!t.see_in_action, straddleEnabled: !!(t.advanced_flags || {}).straddle, runItMultiple: !!(t.advanced_flags || {}).runItMultiple, splitEv: !!(t.advanced_flags || {}).splitEv });
+    setupTableDuration(rt, t);;
     rt.tableName = t.name; rt.tableId = t.id;
     rt.jackpotEnabled = !!club.jackpot_enabled; rt.jackpotBalance = Number(club.jackpot_balance || 0);
+    rt.autoStart = t.auto_start !== false; rt.minStartPlayers = t.min_start_players || 2; rt.chatBanned = !!t.chat_banned;
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
     ctx.reply({ ok: true, code });
     broadcastTable(code);
+    return;
+  }
+
+  // CAPTCHA local (sem serviço externo, sem credencial nenhuma) — uma
+  // continha simples de somar dois números pequenos. Guardada no
+  // próprio socket, expira em 2 minutos.
+  if (type === "request_table_captcha") {
+    if (!requireAuth(ws, ctx)) return;
+    const a = 2 + Math.floor(Math.random() * 8);
+    const b = 2 + Math.floor(Math.random() * 8);
+    ws.pendingCaptcha = { code: (msg.code || "").toUpperCase(), answer: a + b, expires: Date.now() + 120000 };
+    ctx.reply({ ok: true, question: `${a} + ${b}` });
     return;
   }
 
@@ -1859,9 +2017,85 @@ async function handleMessage(ws, msg, ctx) {
     }
     const member = await getMember(club.id, ws.userId);
     const minBuyIn = t.buy_in;
-    const maxBuyIn = t.buy_in * 4;
+    const maxBuyIn = t.max_buy_in || t.buy_in * 4;
     if (!member || Number(member.chips) < minBuyIn) return ctx.reply({ ok: false, error: "Royalle Pay insuficiente." });
+    // High Roller: só quem já tem o saldo mínimo configurado pode sentar.
+    const flags = t.advanced_flags || {};
+    if (flags.highRoller && Number(member.chips) < Number(flags.highRollerMin || 0)) {
+      return ctx.reply({ ok: false, error: `Mesa High Roller — saldo mínimo de ${Number(flags.highRollerMin || 0).toLocaleString("pt-BR")} pra entrar.` });
+    }
     const buyIn = Math.min(maxBuyIn, Math.max(minBuyIn, Number(msg.buyIn) || minBuyIn), Number(member.chips));
+    // "Restrição de IP": ninguém com o mesmo IP de quem já tá sentado
+    // consegue sentar — olha os sockets realmente conectados nessa mesa
+    // agora (rt.socketToPlayer), não algum cadastro antigo.
+    if (flags.ipRestriction && ws.remoteIp) {
+      const rtCheck = runtime.get(code);
+      if (rtCheck?.socketToPlayer) {
+        for (const otherWs of rtCheck.socketToPlayer.keys()) {
+          if (otherWs !== ws && otherWs.remoteIp && otherWs.remoteIp === ws.remoteIp) {
+            return ctx.reply({ ok: false, error: "Restrição de IP: já tem alguém com esse mesmo IP sentado nessa mesa." });
+          }
+        }
+      }
+    }
+    // "Restrição de GPS": exige lat/lng do cliente (pedido de permissão
+    // já é feito no app antes de mandar sit_club_table) e recusa se
+    // tiver alguém sentado mais perto que o mínimo configurado.
+    if (flags.gpsRestriction) {
+      const minMeters = Number(flags.gpsMinMeters) || 100;
+      if (!(msg.lat != null && msg.lng != null)) {
+        return ctx.reply({ ok: false, error: "Essa mesa exige localização pra sentar — ative o GPS e tenta de novo." });
+      }
+      const rtCheck = runtime.get(code);
+      const seatedCoords = rtCheck?.seatedCoords || {};
+      for (const [otherUsername, coord] of Object.entries(seatedCoords)) {
+        if (otherUsername === ws.username) continue;
+        const meters = haversineMeters(msg.lat, msg.lng, coord.lat, coord.lng);
+        if (meters < minMeters) {
+          return ctx.reply({ ok: false, error: "Restrição de GPS: tem alguém sentado perto demais dessa mesa." });
+        }
+      }
+    }
+    // CAPTCHA: precisa ter pedido a continha (request_table_captcha)
+    // pra essa mesma mesa e mandado a resposta certa dentro de 2min. Se
+    // falhar, a regra oficial remove da mesa e não deixa voltar — aqui
+    // só recusa a entrada mesmo (não tem "mesa" pra remover ainda).
+    if (flags.captcha) {
+      const pc = ws.pendingCaptcha;
+      if (!pc || pc.code !== code || Date.now() > pc.expires) {
+        return ctx.reply({ ok: false, error: "Resolve o CAPTCHA antes de sentar.", needsCaptcha: true });
+      }
+      if (Number(msg.captchaAnswer) !== pc.answer) {
+        ws.pendingCaptcha = null;
+        return ctx.reply({ ok: false, error: "CAPTCHA errado — tenta de novo.", needsCaptcha: true });
+      }
+      ws.pendingCaptcha = null;
+    }
+    // "Autorizado a fazer buy-in": em vez de sentar na hora, vira um
+    // pedido que o dono/gestor precisa aprovar — guardado na própria
+    // mesa em memória (mesa é algo efêmero, não precisa sobreviver a um
+    // restart do servidor pra isso fazer sentido).
+    async function isAdminOfClub() {
+      const meMember = member; // já temos os dados de member acima
+      return meMember?.role === "owner" || meMember?.role === "agent";
+    }
+    if (t.buyin_requires_approval && !(await isAdminOfClub())) {
+      const rtPending = ensureQuickRuntime(code, t.variant, null);
+      rtPending.isQuick = false; rtPending.clubId = club.id; rtPending.clubCode = club.code;
+      rtPending.tableName = t.name; rtPending.tableId = t.id;
+      rtPending.pendingBuyins = rtPending.pendingBuyins || [];
+      if (rtPending.pendingBuyins.some((r) => r.username === ws.username)) {
+        return ctx.reply({ ok: false, pending: true, error: "Seu pedido de buy-in já está aguardando aprovação." });
+      }
+      rtPending.pendingBuyins.push({ username: ws.username, userId: ws.userId, buyIn, seat: Number.isInteger(msg.seat) ? msg.seat : null, avatar: member.avatar, at: Date.now() });
+      ctx.reply({ ok: true, pending: true });
+      // Avisa quem pode aprovar (dono/gestores online) pra não ficar
+      // esperando sem saber que tem pedido — mesma ideia do
+      // table_assigned de torneio.
+      const admins = (await listMembers(club.id)).filter((m) => m.role === "owner" || m.role === "agent");
+      for (const a of admins) pushToUser(a.username, { type: "buyin_requested", code, username: ws.username });
+      return;
+    }
     await adjustMemberChips(club.id, ws.userId, -buyIn);
     const rt = ensureQuickRuntime(code, t.variant, null);
     rt.isQuick = false; // usa carteira de clube (Royalle Pay), não a avulsa
@@ -1869,13 +2103,73 @@ async function handleMessage(ws, msg, ctx) {
     rt.clubCode = club.code;
     rt.tableName = t.name; rt.tableId = t.id;
     rt.jackpotEnabled = !!club.jackpot_enabled; rt.jackpotBalance = Number(club.jackpot_balance || 0);
-    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
+    rt.autoStart = t.auto_start !== false; rt.minStartPlayers = t.min_start_players || 2; rt.chatBanned = !!t.chat_banned;
+    if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players, rakeCapBb: Number(t.rake_cap_bb ?? 3), actionSeconds: t.action_seconds || 30, revealFoldedCards: t.show_folded_cards !== false,
+      seeInAction: !!t.see_in_action, straddleEnabled: !!(t.advanced_flags || {}).straddle, runItMultiple: !!(t.advanced_flags || {}).runItMultiple, splitEv: !!(t.advanced_flags || {}).splitEv });
+    setupTableDuration(rt, t);;
     rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
     recordSessionBuyIn(rt.table, ws.username, buyIn);
+    if (flags.gpsRestriction && msg.lat != null && msg.lng != null) {
+      rt.seatedCoords = rt.seatedCoords || {};
+      rt.seatedCoords[ws.username] = { lat: msg.lat, lng: msg.lng };
+    }
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
     ctx.reply({ ok: true, code });
+    broadcastTable(code);
+    return;
+  }
+
+  // Lista os pedidos de buy-in pendentes dessa mesa (só dono/gestor).
+  if (type === "list_table_buyin_requests") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.clubId) return ctx.reply({ ok: true, requests: [] });
+    const me = await getMember(rt.clubId, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
+    ctx.reply({ ok: true, requests: (rt.pendingBuyins || []).map((r) => ({ username: r.username, buyIn: r.buyIn, avatar: r.avatar })) });
+    return;
+  }
+
+  if (type === "approve_table_buyin" || type === "reject_table_buyin") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.clubId) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const me = await getMember(rt.clubId, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
+    rt.pendingBuyins = rt.pendingBuyins || [];
+    const idx = rt.pendingBuyins.findIndex((r) => r.username === msg.username);
+    if (idx === -1) return ctx.reply({ ok: false, error: "Pedido não encontrado (já foi decidido?)." });
+    const [req] = rt.pendingBuyins.splice(idx, 1);
+    if (type === "reject_table_buyin") {
+      pushToUser(req.username, { type: "buyin_rejected", code });
+      ctx.reply({ ok: true });
+      return;
+    }
+    // Aprovado: só agora debita e senta de verdade — o pedido em si
+    // nunca reservou ficha nenhuma, pra não travar dinheiro da pessoa
+    // enquanto espera uma resposta que pode nunca vir.
+    const member = await getMember(rt.clubId, req.userId);
+    if (!member || Number(member.chips) < req.buyIn) {
+      pushToUser(req.username, { type: "buyin_rejected", code, reason: "insufficient" });
+      return ctx.reply({ ok: false, error: "Jogador não tem mais saldo suficiente." });
+    }
+    await adjustMemberChips(rt.clubId, req.userId, -req.buyIn);
+    if (!rt.table) {
+      const t = await getClubTableById(rt.clubId, rt.tableId);
+      if (t) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players, rakeCapBb: Number(t.rake_cap_bb ?? 3), actionSeconds: t.action_seconds || 30, revealFoldedCards: t.show_folded_cards !== false,
+      seeInAction: !!t.see_in_action, straddleEnabled: !!(t.advanced_flags || {}).straddle, runItMultiple: !!(t.advanced_flags || {}).runItMultiple, splitEv: !!(t.advanced_flags || {}).splitEv });
+    setupTableDuration(rt, t);;
+    }
+    if (rt.table) {
+      rt.table.addPlayer(req.username, req.username, req.buyIn, false, req.seat);
+      recordSessionBuyIn(rt.table, req.username, req.buyIn);
+    }
+    pushToUser(req.username, { type: "buyin_approved", code });
+    ctx.reply({ ok: true });
     broadcastTable(code);
     return;
   }
@@ -1939,6 +2233,9 @@ async function handleMessage(ws, msg, ctx) {
     const rt = runtime.get(code);
     if (!rt?.table) return ctx.reply({ ok: false });
     if (rt.table.stage !== "idle" && rt.table.stage !== "showdown") return ctx.reply({ ok: false, error: "Já tem uma mão em andamento." });
+    if (rt.table.players.filter((p) => p.chips > 0).length < (rt.minStartPlayers || 2)) {
+      return ctx.reply({ ok: false, error: "Faltam jogadores pra atingir o mínimo dessa mesa." });
+    }
     rt.table.startHand();
     ctx.reply({ ok: true });
     broadcastTable(code);
@@ -2268,6 +2565,20 @@ async function handleMessage(ws, msg, ctx) {
     const username = rt.socketToPlayer.get(ws);
     const player = rt.table.players.find((p) => p.id === username);
 
+    // "Tempo decretado" (variante "Sobre o lucro"): enquanto o jogador
+    // estiver no positivo nessa sessão dessa mesa, ele não consegue
+    // sair — só quando o lucro cair pra 0 ou menos, ou as fichas
+    // acabarem. Confere ANTES de mexer em qualquer coisa.
+    if (player && rt.clubId && rt.tableId) {
+      const tCfg = await getClubTableById(rt.clubId, rt.tableId);
+      if (tCfg?.advanced_flags?.decreedTime) {
+        const stats = await getTablePlayerStats(rt.tableId, ws.userId);
+        if (Number(stats.session_profit_chips) > 0 && player.chips > 0) {
+          return ctx.reply({ ok: false, error: "Tempo decretado: você está no lucro nessa mesa, não dá pra sair agora." });
+        }
+      }
+    }
+
     // Mão em andamento e o jogador ainda está nela: não dá pra tirar da
     // mesa agora sem bagunçar o pote (ele já apostou fichas nessa mão).
     // Marca "sair assim que a mão terminar" — ele continua jogando essa
@@ -2326,8 +2637,11 @@ async function handleMessage(ws, msg, ctx) {
   ctx.reply({ ok: false, error: `Tipo de mensagem desconhecido: ${type}` });
 }
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   console.log("Nova conexão WebSocket recebida.");
+  // Pro "Restrição de IP" — se tiver um proxy na frente (Render usa),
+  // o IP real vem no header, não no socket direto.
+  ws.remoteIp = (req?.headers?.["x-forwarded-for"] || "").split(",")[0].trim() || req?.socket?.remoteAddress || null;
   let joinedCode = null;
 
   ws.on("message", async (raw) => {
@@ -2379,6 +2693,7 @@ migrate()
     // sozinho (chegou a hora) ou subir de nível de blind.
     setInterval(() => { tickTournaments(); }, 15000);
     setInterval(() => { tickActionTimeouts(); }, 1000);
+    setInterval(() => { tickTableDurations().catch((err) => console.error("Erro no relógio de duração de mesa:", err.message)); }, 30000);
   })
   .catch((err) => {
     console.error("Falha ao migrar banco de dados:", err);

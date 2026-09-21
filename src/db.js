@@ -132,6 +132,60 @@ export async function migrate() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Nome da mesa (pra aparecer no rodapé/lista) — nunca existiu de
+  // verdade, mesmo já sendo referenciado em outro lugar do código.
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS name TEXT;`);
+  // Configurações reais (com mecanismo de verdade por trás, não só
+  // aparência) da tela "Criar mesa" — igual ao pppoker que o Carlos
+  // mandou de referência.
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS action_seconds INTEGER NOT NULL DEFAULT 30;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS max_buy_in INTEGER;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 0;`); // 0 = sem limite
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS auto_extend BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS auto_extend_times INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS auto_start BOOLEAN NOT NULL DEFAULT true;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS min_start_players INTEGER NOT NULL DEFAULT 2;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS rake_cap_bb NUMERIC NOT NULL DEFAULT 3;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS exclusive BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS buyin_requires_approval BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS chat_banned BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS show_folded_cards BOOLEAN NOT NULL DEFAULT true;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS see_in_action BOOLEAN NOT NULL DEFAULT false;`);
+  // Opções avançadas que ainda são só CONFIGURAÇÃO SALVA — sem mecanismo
+  // rodando por trás ainda (straddle automático, bater várias vezes,
+  // dividir EV, High Roller, VPIP, tempo decretado, restrições de
+  // GPS/IP/PC/e-mail, CAPTCHA). Ficam num JSON só pra não precisar de
+  // uma coluna pra cada uma; o campo existe e é salvo, mas o Royalle
+  // ainda não FAZ nada com ele — ver aviso na resposta.
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS advanced_flags JSONB NOT NULL DEFAULT '{}';`);
+  // Mecanismos que estavam só na aba "Opções avançadas"/"Jogo limpo" e
+  // agora ganham coluna própria (mecanismo real, não só configuração
+  // salva) — ver detalhe de cada um nos comentários do index.js.
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS high_roller BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS high_roller_min INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS vpip_min INTEGER NOT NULL DEFAULT 0;`); // 0 = desligado
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS vpip_level INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS vpip_hand_limit INTEGER NOT NULL DEFAULT 30;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS decreed_time BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS ip_restriction BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS gps_restriction BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS gps_min_meters INTEGER NOT NULL DEFAULT 100;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS straddle_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS run_it_multiple BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS split_ev BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE club_tables ADD COLUMN IF NOT EXISTS captcha_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  // Estado runtime do "Tempo decretado" e VPIP por jogador/mesa — fica
+  // por linha (club_id+table_id+user_id) pra sobreviver a reconexão.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS table_player_stats (
+      club_table_id INTEGER NOT NULL REFERENCES club_tables(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      hands_played INTEGER NOT NULL DEFAULT 0,
+      hands_vpip INTEGER NOT NULL DEFAULT 0,
+      session_profit_chips BIGINT NOT NULL DEFAULT 0,
+      PRIMARY KEY (club_table_id, user_id)
+    );
+  `);
   // Histórico persistente de envio/retirada de Royalle Pay pelo dono/admin.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pay_ledger (

@@ -268,16 +268,71 @@ export async function listClubTables(clubId) {
   return mem.clubTables.filter((t) => t.club_id === clubId);
 }
 
-export async function createClubTable({ clubId, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers }) {
+// Campos "avançados" da criação de mesa — os com mecanismo real ganham
+// coluna própria; os que ainda são só configuração salva (sem
+// aplicação ainda) vão dentro de advancedFlags (JSON).
+function tableAdvancedDefaults(o = {}) {
+  return {
+    name: o.name || null,
+    actionSeconds: Math.max(5, Number(o.actionSeconds) || 30),
+    maxBuyIn: o.maxBuyIn != null ? Number(o.maxBuyIn) : null,
+    durationMinutes: Math.max(0, Number(o.durationMinutes) || 0),
+    autoExtend: !!o.autoExtend,
+    autoExtendTimes: Math.max(0, Number(o.autoExtendTimes) || 0),
+    autoStart: o.autoStart !== false,
+    minStartPlayers: Math.max(2, Number(o.minStartPlayers) || 2),
+    rakeCapBb: Math.max(0, Number(o.rakeCapBb) || 3),
+    exclusive: !!o.exclusive,
+    buyinRequiresApproval: !!o.buyinRequiresApproval,
+    chatBanned: !!o.chatBanned,
+    showFoldedCards: o.showFoldedCards !== false,
+    seeInAction: !!o.seeInAction,
+    advancedFlags: o.advancedFlags && typeof o.advancedFlags === "object" ? o.advancedFlags : {},
+    highRoller: !!o.highRoller,
+    highRollerMin: Math.max(0, Number(o.highRollerMin) || 0),
+    vpipMin: Math.max(0, Math.min(100, Number(o.vpipMin) || 0)),
+    vpipLevel: Math.max(0, Math.min(100, Number(o.vpipLevel) || 0)),
+    vpipHandLimit: Math.max(1, Number(o.vpipHandLimit) || 30),
+    decreedTime: !!o.decreedTime,
+    ipRestriction: !!o.ipRestriction,
+    gpsRestriction: !!o.gpsRestriction,
+    gpsMinMeters: Math.max(1, Number(o.gpsMinMeters) || 100),
+    straddleEnabled: !!o.straddleEnabled,
+    runItMultiple: !!o.runItMultiple,
+    splitEv: !!o.splitEv,
+    captchaEnabled: !!o.captchaEnabled,
+  };
+}
+
+export async function createClubTable(opts) {
+  const { clubId, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers } = opts;
+  const a = tableAdvancedDefaults(opts);
   if (hasDatabase) {
     const { rows } = await pool.query(
-      `INSERT INTO club_tables (club_id, variant, small_blind, big_blind, buy_in, rake_percent, max_players)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [clubId, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers]
+      `INSERT INTO club_tables (club_id, variant, small_blind, big_blind, buy_in, rake_percent, max_players,
+        name, action_seconds, max_buy_in, duration_minutes, auto_extend, auto_extend_times, auto_start,
+        min_start_players, rake_cap_bb, exclusive, buyin_requires_approval, chat_banned, show_folded_cards, see_in_action, advanced_flags,
+        high_roller, high_roller_min, vpip_min, vpip_level, vpip_hand_limit, decreed_time, ip_restriction, gps_restriction, gps_min_meters,
+        straddle_enabled, run_it_multiple, split_ev, captcha_enabled)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35) RETURNING *`,
+      [clubId, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers,
+        a.name, a.actionSeconds, a.maxBuyIn, a.durationMinutes, a.autoExtend, a.autoExtendTimes, a.autoStart,
+        a.minStartPlayers, a.rakeCapBb, a.exclusive, a.buyinRequiresApproval, a.chatBanned, a.showFoldedCards, a.seeInAction, JSON.stringify(a.advancedFlags),
+        a.highRoller, a.highRollerMin, a.vpipMin, a.vpipLevel, a.vpipHandLimit, a.decreedTime, a.ipRestriction, a.gpsRestriction, a.gpsMinMeters,
+        a.straddleEnabled, a.runItMultiple, a.splitEv, a.captchaEnabled]
     );
     return rows[0];
   }
-  const t = { id: mem.nextClubTableId++, club_id: clubId, variant, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, max_players: maxPlayers };
+  const t = {
+    id: mem.nextClubTableId++, club_id: clubId, variant, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, max_players: maxPlayers,
+    name: a.name, action_seconds: a.actionSeconds, max_buy_in: a.maxBuyIn, duration_minutes: a.durationMinutes,
+    auto_extend: a.autoExtend, auto_extend_times: a.autoExtendTimes, auto_start: a.autoStart, min_start_players: a.minStartPlayers,
+    rake_cap_bb: a.rakeCapBb, exclusive: a.exclusive, buyin_requires_approval: a.buyinRequiresApproval, chat_banned: a.chatBanned,
+    show_folded_cards: a.showFoldedCards, see_in_action: a.seeInAction, advanced_flags: a.advancedFlags,
+    high_roller: a.highRoller, high_roller_min: a.highRollerMin, vpip_min: a.vpipMin, vpip_level: a.vpipLevel, vpip_hand_limit: a.vpipHandLimit,
+    decreed_time: a.decreedTime, ip_restriction: a.ipRestriction, gps_restriction: a.gpsRestriction, gps_min_meters: a.gpsMinMeters,
+    straddle_enabled: a.straddleEnabled, run_it_multiple: a.runItMultiple, split_ev: a.splitEv, captcha_enabled: a.captchaEnabled,
+  };
   mem.clubTables.push(t);
   return t;
 }
@@ -290,19 +345,74 @@ export async function getClubTableById(clubId, tableId) {
   return mem.clubTables.find((t) => t.id === Number(tableId) && t.club_id === clubId) || null;
 }
 
-export async function updateClubTable(clubId, tableId, { variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers }) {
+export async function updateClubTable(clubId, tableId, opts) {
+  const { variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers } = opts;
+  const a = tableAdvancedDefaults(opts);
   if (hasDatabase) {
     const { rows } = await pool.query(
-      `UPDATE club_tables SET variant=$3, small_blind=$4, big_blind=$5, buy_in=$6, rake_percent=$7, max_players=$8
+      `UPDATE club_tables SET variant=$3, small_blind=$4, big_blind=$5, buy_in=$6, rake_percent=$7, max_players=$8,
+        name=$9, action_seconds=$10, max_buy_in=$11, duration_minutes=$12, auto_extend=$13, auto_extend_times=$14,
+        auto_start=$15, min_start_players=$16, rake_cap_bb=$17, exclusive=$18, buyin_requires_approval=$19,
+        chat_banned=$20, show_folded_cards=$21, see_in_action=$22, advanced_flags=$23,
+        high_roller=$24, high_roller_min=$25, vpip_min=$26, vpip_level=$27, vpip_hand_limit=$28, decreed_time=$29,
+        ip_restriction=$30, gps_restriction=$31, gps_min_meters=$32, straddle_enabled=$33, run_it_multiple=$34, split_ev=$35, captcha_enabled=$36
        WHERE id=$1 AND club_id=$2 RETURNING *`,
-      [tableId, clubId, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers]
+      [tableId, clubId, variant, smallBlind, bigBlind, buyIn, rakePercent, maxPlayers,
+        a.name, a.actionSeconds, a.maxBuyIn, a.durationMinutes, a.autoExtend, a.autoExtendTimes, a.autoStart,
+        a.minStartPlayers, a.rakeCapBb, a.exclusive, a.buyinRequiresApproval, a.chatBanned, a.showFoldedCards, a.seeInAction, JSON.stringify(a.advancedFlags),
+        a.highRoller, a.highRollerMin, a.vpipMin, a.vpipLevel, a.vpipHandLimit, a.decreedTime, a.ipRestriction, a.gpsRestriction, a.gpsMinMeters,
+        a.straddleEnabled, a.runItMultiple, a.splitEv, a.captchaEnabled]
     );
     return rows[0] || null;
   }
   const t = mem.clubTables.find((t) => t.id === Number(tableId) && t.club_id === clubId);
   if (!t) return null;
-  Object.assign(t, { variant, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, max_players: maxPlayers });
+  Object.assign(t, {
+    variant, small_blind: smallBlind, big_blind: bigBlind, buy_in: buyIn, rake_percent: rakePercent, max_players: maxPlayers,
+    name: a.name, action_seconds: a.actionSeconds, max_buy_in: a.maxBuyIn, duration_minutes: a.durationMinutes,
+    auto_extend: a.autoExtend, auto_extend_times: a.autoExtendTimes, auto_start: a.autoStart, min_start_players: a.minStartPlayers,
+    rake_cap_bb: a.rakeCapBb, exclusive: a.exclusive, buyin_requires_approval: a.buyinRequiresApproval, chat_banned: a.chatBanned,
+    show_folded_cards: a.showFoldedCards, see_in_action: a.seeInAction, advanced_flags: a.advancedFlags,
+    high_roller: a.highRoller, high_roller_min: a.highRollerMin, vpip_min: a.vpipMin, vpip_level: a.vpipLevel, vpip_hand_limit: a.vpipHandLimit,
+    decreed_time: a.decreedTime, ip_restriction: a.ipRestriction, gps_restriction: a.gpsRestriction, gps_min_meters: a.gpsMinMeters,
+    straddle_enabled: a.straddleEnabled, run_it_multiple: a.runItMultiple, split_ev: a.splitEv, captcha_enabled: a.captchaEnabled,
+  });
   return t;
+}
+
+// Estado por jogador+mesa (VPIP e lucro de sessão pro Tempo Decretado) —
+// lido/gravado a cada mão, sobrevive reconexão porque fica no banco.
+export async function getTablePlayerStats(clubTableId, userId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("SELECT * FROM table_player_stats WHERE club_table_id=$1 AND user_id=$2", [clubTableId, userId]);
+    return rows[0] || { club_table_id: clubTableId, user_id: userId, hands_played: 0, hands_vpip: 0, session_profit_chips: 0 };
+  }
+  mem.tablePlayerStats = mem.tablePlayerStats || [];
+  return mem.tablePlayerStats.find((s) => s.club_table_id === clubTableId && s.user_id === userId)
+    || { club_table_id: clubTableId, user_id: userId, hands_played: 0, hands_vpip: 0, session_profit_chips: 0 };
+}
+
+export async function bumpTablePlayerStats(clubTableId, userId, { vpip, profitDelta }) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO table_player_stats (club_table_id, user_id, hands_played, hands_vpip, session_profit_chips)
+       VALUES ($1,$2,1,$3,$4)
+       ON CONFLICT (club_table_id, user_id) DO UPDATE SET
+         hands_played = table_player_stats.hands_played + 1,
+         hands_vpip = table_player_stats.hands_vpip + $3,
+         session_profit_chips = table_player_stats.session_profit_chips + $4
+       RETURNING *`,
+      [clubTableId, userId, vpip ? 1 : 0, profitDelta || 0]
+    );
+    return rows[0];
+  }
+  mem.tablePlayerStats = mem.tablePlayerStats || [];
+  let s = mem.tablePlayerStats.find((s) => s.club_table_id === clubTableId && s.user_id === userId);
+  if (!s) { s = { club_table_id: clubTableId, user_id: userId, hands_played: 0, hands_vpip: 0, session_profit_chips: 0 }; mem.tablePlayerStats.push(s); }
+  s.hands_played += 1;
+  s.hands_vpip += vpip ? 1 : 0;
+  s.session_profit_chips += profitDelta || 0;
+  return s;
 }
 
 export async function deleteClubTable(clubId, tableId) {
