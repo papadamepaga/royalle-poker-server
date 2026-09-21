@@ -634,12 +634,27 @@ async function sweepPendingLeaves(code) {
   if (runtime.has(code)) broadcastTable(code);
 }
 
+// Depois que o dono liga/desliga o jackpot ou injeta ficha manual, as
+// mesas do clube que já estão abertas precisam refletir isso na hora —
+// sem esperar a próxima mão terminar. Varre o runtime, atualiza só as
+// mesas desse clube e reenvia o estado.
+async function refreshJackpotOnRuntimes(clubId) {
+  const club = await getClubById(clubId);
+  if (!club) return;
+  for (const [code, rt] of runtime.entries()) {
+    if (rt.clubId !== clubId || !rt.table) continue;
+    rt.jackpotEnabled = !!club.jackpot_enabled;
+    rt.jackpotBalance = Number(club.jackpot_balance || 0);
+    broadcastTable(code);
+  }
+}
+
 function broadcastTable(code) {
   const rt = runtime.get(code);
   const table = rt?.table;
   if (!table) return;
   for (const [ws, username] of rt.socketToPlayer.entries()) {
-    send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null } });
+    send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0) } });
   }
   maybeRecordRake(rt, code);
   maybeRecordHandLedger(rt, code);
@@ -674,10 +689,12 @@ async function maybeRecordRake(rt, code) {
     let clubAmountAfterJackpot = clubAmount;
     if (rt.clubId && clubAmount > 0) {
       const club = await getClubById(rt.clubId);
+      rt.jackpotEnabled = !!club?.jackpot_enabled;
+      rt.jackpotBalance = Number(club?.jackpot_balance || 0);
       if (club?.jackpot_enabled && Number(club.jackpot_rake_percent) > 0) {
         const jackpotCut = Math.floor((clubAmount * Number(club.jackpot_rake_percent)) / 100);
         if (jackpotCut > 0) {
-          await addJackpotChips(rt.clubId, jackpotCut);
+          rt.jackpotBalance = await addJackpotChips(rt.clubId, jackpotCut);
           clubAmountAfterJackpot -= jackpotCut;
         }
       }
@@ -978,6 +995,7 @@ async function handleMessage(ws, msg, ctx) {
     await setJackpotConfig(club.id, { enabled: !!msg.enabled, rakePercent: msg.rakePercent });
     ctx.reply({ ok: true });
     await broadcastClub(club.code);
+    refreshJackpotOnRuntimes(club.id);
     return;
   }
 
@@ -996,6 +1014,7 @@ async function handleMessage(ws, msg, ctx) {
     await addJackpotChips(club.id, amount);
     ctx.reply({ ok: true });
     await broadcastClub(club.code);
+    refreshJackpotOnRuntimes(club.id);
     return;
   }
 
@@ -1245,7 +1264,7 @@ async function handleMessage(ws, msg, ctx) {
       members: membersForViewer(members, ws.username, viewerIsOwner),
       weeklyRake,
     });
-    if (rt.table) send(ws, { type: "table_state", state: { ...rt.table.getPublicState(ws.username), tableName: rt.tableName || null, tableId: rt.tableId ?? null } });
+    if (rt.table) send(ws, { type: "table_state", state: { ...rt.table.getPublicState(ws.username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0) } });
     return;
   }
 
@@ -1715,6 +1734,7 @@ async function handleMessage(ws, msg, ctx) {
     const rt = ensureRuntime(code, club.id);
     if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
     rt.tableName = t.name; rt.tableId = t.id;
+    rt.jackpotEnabled = !!club.jackpot_enabled; rt.jackpotBalance = Number(club.jackpot_balance || 0);
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
@@ -1754,6 +1774,7 @@ async function handleMessage(ws, msg, ctx) {
     rt.clubId = club.id;
     rt.clubCode = club.code;
     rt.tableName = t.name; rt.tableId = t.id;
+    rt.jackpotEnabled = !!club.jackpot_enabled; rt.jackpotBalance = Number(club.jackpot_balance || 0);
     if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players });
     rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
     recordSessionBuyIn(rt.table, ws.username, buyIn);
