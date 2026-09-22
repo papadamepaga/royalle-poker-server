@@ -1186,7 +1186,7 @@ async function handleMessage(ws, msg, ctx) {
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
     const me = await getMember(club.id, ws.userId);
     if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Só o dono ou um gestor pode mexer no jackpot." });
-    await setJackpotConfig(club.id, { enabled: !!msg.enabled, type: msg.type, feeMode: msg.feeMode });
+    await setJackpotConfig(club.id, { enabled: !!msg.enabled, type: msg.jackpotType, feeMode: msg.feeMode });
     const fresh = await getClubById(club.id);
     // Devolve os campos atualizados na hora, na própria resposta — o
     // broadcastClub só alcança quem já tá com uma mesa desse clube
