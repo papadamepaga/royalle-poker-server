@@ -289,6 +289,50 @@ export async function migrate() {
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bounty_enabled BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bounty_percent INTEGER NOT NULL DEFAULT 50;`);
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS payout_percent INTEGER NOT NULL DEFAULT 12;`);
+  // % de premiação passa a aceitar fração (12.5%, igual o pppoker) — por
+  // isso migra pra NUMERIC em vez de INTEGER.
+  await pool.query(`ALTER TABLE tournaments ALTER COLUMN payout_percent TYPE NUMERIC USING payout_percent::numeric;`);
+  // ---- Configurações avançadas de MTT (rebuy/add-on com multiplicador,
+  // K.O. Regular/Progressivo/Misterioso, ITM, blind customizado, Early
+  // Bird com bônus de fichas, recorrência) — igual ao pppoker que o
+  // Carlos mandou de referência. As chaves menos estruturais (limite de
+  // Time Bank, restrições de PC/e-mail/região, Multi-Dias, MTT
+  // recorrente) ficam dentro de advanced_flags (JSONB), no mesmo padrão
+  // já usado em club_tables — mecanismo real quando descrito como tal
+  // no código, senão é só configuração salva (ver comentários abaixo).
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rebuy_multiplier NUMERIC NOT NULL DEFAULT 1.0;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rebuy_double BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rebuy_triple BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS addon_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS addon_multiplier NUMERIC NOT NULL DEFAULT 1.0;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS addon_double BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS addon_triple BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS addon_pause_minutes INTEGER NOT NULL DEFAULT 5;`);
+  // ko_mode: 'off' | 'regular' | 'progressive' | 'mystery' — ver
+  // payKnockoutBounty() no index.js pros três mecanismos reais.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS ko_mode TEXT NOT NULL DEFAULT 'regular';`);
+  // Pote acumulado do K.O. Misterioso antes da fase ITM (ninguém recebe
+  // nada por eliminação nessa fase — só acumula; depois vira prêmios
+  // sorteados, ver tournamentMysteryPrizes()).
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS mystery_pool BIGINT NOT NULL DEFAULT 0;`);
+  // itm_mode: 'players' (conta só jogadores) | 'buyins' (conta total de
+  // buy-ins, incluindo rebuys e add-ons). payout_weighting: 'flat' |
+  // 'standard' | 'aggressive' — controla o quanto o 1º lugar leva mais
+  // que o resto.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS itm_mode TEXT NOT NULL DEFAULT 'buyins';`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS payout_weighting TEXT NOT NULL DEFAULT 'standard';`);
+  // Early Bird — bônus de fichas iniciais (além do desconto que já
+  // existia), válido pro primeiro buy-in até o nível de blind escolhido.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS early_bird_chip_bonus_pct INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS early_bird_chip_bonus_level INTEGER NOT NULL DEFAULT 0;`);
+  // Registro tardio por NÍVEL de blind (além do por minutos que já
+  // existia) — quando preenchido, tem prioridade sobre late_reg_minutes.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS late_reg_level INTEGER;`);
+  // Estrutura de blind customizada ("Personalizar>>") — array de
+  // {sb,bb,ante}; quando preenchida, substitui a fórmula de
+  // tournamentBlindLevel() pra esse torneio.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS custom_blind_levels JSONB;`);
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS advanced_flags JSONB NOT NULL DEFAULT '{}';`);
   // Nível do clube (0-10) — cada nível paga em diamantes por 30 dias e dá
   // mais capacidade de membros/gestores, igual o "Clube Nível" do PPPoker.
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS level INTEGER NOT NULL DEFAULT 0;`);
@@ -333,6 +377,14 @@ export async function migrate() {
   // devolver exatamente isso, nunca o "chips" (que é só a pilha inicial
   // de fichas do torneio, um número totalmente diferente).
   await pool.query(`ALTER TABLE tournament_entries ADD COLUMN IF NOT EXISTS buy_in_paid BIGINT;`);
+  // Add-on: só pode ser usado uma vez, na janela depois do fim do
+  // registro tardio.
+  await pool.query(`ALTER TABLE tournament_entries ADD COLUMN IF NOT EXISTS addon_used BOOLEAN NOT NULL DEFAULT false;`);
+  // K.O. Progressivo: pote de bounty PRÓPRIO desse jogador — cresce cada
+  // vez que ele elimina alguém (metade na hora, metade fica aqui) e é
+  // pago inteiro pra quem eliminar ELE, ou de volta pra ele mesmo se for
+  // o campeão (nunca é eliminado).
+  await pool.query(`ALTER TABLE tournament_entries ADD COLUMN IF NOT EXISTS bounty_pool BIGINT NOT NULL DEFAULT 0;`);
 
   // ============================================================
   // SISTEMA DE RAKE / RAKEBACK / AGENTE (comissão) / FECHAMENTO

@@ -432,16 +432,29 @@ export async function createTournament(cfg) {
     gtdPrize, startTime, createdBy,
     earlyBirdDiscountPct = 0, earlyBirdDeadline = null,
     bountyEnabled = false, bountyPercent = 50, payoutPercent = 12,
+    rebuyMultiplier = 1.0, rebuyDouble = false, rebuyTriple = false,
+    addonEnabled = false, addonMultiplier = 1.0, addonDouble = false, addonTriple = false, addonPauseMinutes = 5,
+    koMode = "regular", itmMode = "buyins", payoutWeighting = "standard",
+    earlyBirdChipBonusPct = 0, earlyBirdChipBonusLevel = 0, lateRegLevel = null,
+    customBlindLevels = null, advancedFlags = {},
   } = cfg;
   if (hasDatabase) {
     const { rows } = await pool.query(
       `INSERT INTO tournaments (club_id, name, variant, buy_in, starting_chips, max_players, min_players,
          blind_structure, level_minutes, late_reg_minutes, rebuy_allowed, rebuy_max, gtd_prize, start_time, created_by,
-         early_bird_discount_pct, early_bird_deadline, bounty_enabled, bounty_percent, payout_percent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
+         early_bird_discount_pct, early_bird_deadline, bounty_enabled, bounty_percent, payout_percent,
+         rebuy_multiplier, rebuy_double, rebuy_triple, addon_enabled, addon_multiplier, addon_double, addon_triple,
+         addon_pause_minutes, ko_mode, itm_mode, payout_weighting, early_bird_chip_bonus_pct,
+         early_bird_chip_bonus_level, late_reg_level, custom_blind_levels, advanced_flags)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+         $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36) RETURNING *`,
       [clubId, name, variant, buyIn, startingChips, maxPlayers, minPlayers,
         blindStructure, levelMinutes, lateRegMinutes, rebuyAllowed, rebuyMax, gtdPrize, startTime, createdBy,
-        earlyBirdDiscountPct, earlyBirdDeadline, bountyEnabled, bountyPercent, payoutPercent]
+        earlyBirdDiscountPct, earlyBirdDeadline, bountyEnabled, bountyPercent, payoutPercent,
+        rebuyMultiplier, rebuyDouble, rebuyTriple, addonEnabled, addonMultiplier, addonDouble, addonTriple,
+        addonPauseMinutes, koMode, itmMode, payoutWeighting, earlyBirdChipBonusPct,
+        earlyBirdChipBonusLevel, lateRegLevel, customBlindLevels ? JSON.stringify(customBlindLevels) : null,
+        JSON.stringify(advancedFlags || {})]
     );
     return rows[0];
   }
@@ -453,6 +466,12 @@ export async function createTournament(cfg) {
     level_started_at: null, finished_at: null, created_at: new Date().toISOString(),
     early_bird_discount_pct: earlyBirdDiscountPct, early_bird_deadline: earlyBirdDeadline,
     bounty_enabled: bountyEnabled, bounty_percent: bountyPercent, payout_percent: payoutPercent,
+    rebuy_multiplier: rebuyMultiplier, rebuy_double: rebuyDouble, rebuy_triple: rebuyTriple,
+    addon_enabled: addonEnabled, addon_multiplier: addonMultiplier, addon_double: addonDouble, addon_triple: addonTriple,
+    addon_pause_minutes: addonPauseMinutes, ko_mode: koMode, mystery_pool: 0,
+    itm_mode: itmMode, payout_weighting: payoutWeighting,
+    early_bird_chip_bonus_pct: earlyBirdChipBonusPct, early_bird_chip_bonus_level: earlyBirdChipBonusLevel,
+    late_reg_level: lateRegLevel, custom_blind_levels: customBlindLevels || null, advanced_flags: advancedFlags || {},
   };
   mem.tournaments.push(t);
   return t;

@@ -86,6 +86,16 @@ const wss = new WebSocketServer({ server: httpServer });
 // the live PokerTable instance and which sockets are currently watching
 // or seated at a given club.
 const runtime = new Map(); // code -> { clubId, sockets: Set<ws>, socketToPlayer: Map<ws, username>, table: PokerTable|null }
+// Restrição de GPS/IP em torneio: como as mesas são geradas na hora que
+// o MTT começa (não dá pra checar "quem já tá sentado nessa mesa" igual
+// mesa cash), a checagem acontece na INSCRIÇÃO, contra os outros
+// inscritos no torneio inteiro — tournamentId -> [{ userId, ip, lat, lng }].
+// Fica só em memória (perde num restart do servidor), o suficiente pra
+// coibir múltiplas contas da mesma pessoa/lugar num torneio ao vivo.
+const tournamentRegCoords = new Map();
+// Registro autorizado: fila de pedidos aguardando o dono/gestor aprovar
+// — tournamentId -> [{ userId, username, avatar, requestedAt }].
+const tournamentPendingRegs = new Map();
 // Registro global de quem está online agora (username -> ws), pra poder
 // empurrar avisos pra alguém mesmo fora do contexto de uma mesa/clube
 // específico — como "seu torneio começou, você está na mesa X".
@@ -150,7 +160,23 @@ function freezeSessionResult(table, username, finalChips) {
 // cada mesa toca sozinha até esvaziar. Rebalanceamento fica pra uma
 // próxima etapa.
 
-const BLIND_SPEED_MINUTES = { slow: 15, standard: 10, turbo: 5, hyperturbo: 3 };
+// Estruturas de blind — igual ao dropdown "Estrut. de blinds" do
+// pppoker (Padrão/Turbo/Deep Stack/Especial/Hiperturbo/High Roller).
+// Cada uma só muda a DURAÇÃO do nível e a VELOCIDADE de crescimento do
+// blind (growth = multiplicador do BB a cada nível); a fórmula de valor
+// em si é a mesma (tournamentBlindLevel). Simplificação assumida: não
+// reproduz a tabela oficial nível-a-nível do pppoker (essa é enorme e
+// varia por buy-in) — pra ter os valores exatos, use "Personalizar" na
+// criação do torneio, que grava uma tabela fixa (custom_blind_levels) e
+// passa a valer no lugar dessa fórmula.
+const BLIND_STRUCTURES = {
+  standard: { label: "Padrão", levelMinutes: 10, growth: 1.30 },
+  turbo: { label: "Turbo", levelMinutes: 5, growth: 1.30 },
+  deep_stack: { label: "Deep Stack", levelMinutes: 12, growth: 1.22 },
+  special: { label: "Especial", levelMinutes: 8, growth: 1.28 },
+  hyperturbo: { label: "Hiperturbo", levelMinutes: 3, growth: 1.35 },
+  high_roller: { label: "High Roller", levelMinutes: 15, growth: 1.25 },
+};
 
 // Níveis de clube (Clube Nível, igual PPPoker) — cada um vale 30 dias e
 // dá mais capacidade de membros/gestores. Nível 0 é o padrão gratuito
@@ -185,7 +211,8 @@ function publicTournament(t, entries, myEntry, myUsername) {
   const totalBuyIns = active.reduce((s, e) => s + Number(e.buy_in_paid ?? t.buy_in), 0);
   const totalBountyPaid = entries.reduce((s, e) => s + Number(e.bounty_won || 0), 0);
   const estimatedPool = Math.max(Number(t.gtd_prize) || 0, totalBuyIns - totalBountyPaid);
-  const fractions = tournamentPayoutFractions(active.length, Number(t.payout_percent) || 12);
+  const itmBase = tournamentItmBaseCount(active, t.itm_mode || "buyins");
+  const fractions = tournamentPayoutFractions(itmBase, Number(t.payout_percent) || 12, t.payout_weighting || "standard");
   const payoutTable = fractions.map((f, i) => ({ rank: i + 1, prize: Math.round(estimatedPool * f) }));
   // Mesas ainda em jogo desse torneio, pra aba "Mesas" — não depende de
   // nada além de vasculhar o runtime, já que cada mesa de torneio guarda
@@ -209,35 +236,99 @@ function publicTournament(t, entries, myEntry, myUsername) {
     levelStartedAt: t.level_started_at, finishedAt: t.finished_at,
     earlyBirdDiscountPct: t.early_bird_discount_pct, earlyBirdDeadline: t.early_bird_deadline,
     earlyBirdActive: !!(t.early_bird_deadline && Date.now() < new Date(t.early_bird_deadline).getTime()),
-    bountyEnabled: t.bounty_enabled, bountyPercent: t.bounty_percent, payoutPercent: t.payout_percent,
+    earlyBirdChipBonusPct: t.early_bird_chip_bonus_pct, earlyBirdChipBonusLevel: t.early_bird_chip_bonus_level,
+    bountyEnabled: t.bounty_enabled, bountyPercent: t.bounty_percent, payoutPercent: Number(t.payout_percent),
+    koMode: t.ko_mode, itmMode: t.itm_mode, payoutWeighting: t.payout_weighting,
+    rebuyMultiplier: Number(t.rebuy_multiplier), rebuyDouble: !!t.rebuy_double, rebuyTriple: !!t.rebuy_triple,
+    addonEnabled: !!t.addon_enabled, addonMultiplier: Number(t.addon_multiplier), addonDouble: !!t.addon_double,
+    addonTriple: !!t.addon_triple, addonPauseMinutes: t.addon_pause_minutes,
+    lateRegLevel: t.late_reg_level, customBlindLevels: t.custom_blind_levels || null,
+    advancedFlags: t.advanced_flags || {}, mysteryPool: Number(t.mystery_pool || 0),
     entryCount: active.length,
     playersLeft: active.filter((e) => e.status === "playing" || e.status === "registered").length,
     myStatus: myEntry ? myEntry.status : null,
     myBuyInPaid: myEntry ? Number(myEntry.buy_in_paid ?? t.buy_in) : null,
+    myAddonUsed: myEntry ? !!myEntry.addon_used : false,
+    myRebuys: myEntry ? Number(myEntry.rebuys || 0) : 0,
     estimatedPool, payoutTable, tables, myTableCode,
   };
 }
 
-function tournamentBlindLevel(startingChips, levelIndex) {
+// t pode ser a linha crua do torneio (tournaments) ou só um objeto com
+// starting_chips/blind_structure/custom_blind_levels — os dois formatos
+// batem com o que vem do banco.
+function tournamentBlindLevel(t, levelIndex) {
   const n = Math.max(0, levelIndex);
+  // "Personalizar>>" — tabela fixa gravada na criação do torneio, tem
+  // prioridade sobre a fórmula. Nível além do fim da tabela repete o
+  // último nível gravado (igual pppoker).
+  const custom = t.custom_blind_levels;
+  if (Array.isArray(custom) && custom.length > 0) {
+    const lvl = custom[Math.min(n, custom.length - 1)];
+    return { sb: Number(lvl.sb) || 0, bb: Number(lvl.bb) || 0, ante: Number(lvl.ante) || 0 };
+  }
+  const structure = BLIND_STRUCTURES[t.blind_structure] || BLIND_STRUCTURES.standard;
+  const startingChips = Number(t.starting_chips) || 10000;
   const baseBB = Math.max(20, Math.round(startingChips / 100 / 10) * 10);
-  const bb = Math.round((baseBB * Math.pow(1.3, n)) / 10) * 10;
+  const bb = Math.round((baseBB * Math.pow(structure.growth, n)) / 10) * 10;
   const sb = Math.max(5, Math.round(bb / 2 / 5) * 5);
-  return { sb, bb };
+  return { sb, bb, ante: 0 };
 }
 
 function tournamentTableCode(clubCode, tournamentId, tableIndex) {
   return `${clubCode}#T${tournamentId}-${tableIndex}`;
 }
 
-// Curva de pagamento: ~12% dos inscritos são premiados (mínimo 1), com
-// pesos decrescentes clássicos (cada posição leva 62% do que a de cima
-// levou), normalizados pra somar exatamente o total do prêmio.
-function tournamentPayoutFractions(numEntries, payoutPercent = 12) {
-  const paid = Math.max(1, Math.round(numEntries * (payoutPercent / 100)) || 1);
-  const weights = Array.from({ length: paid }, (_, i) => Math.pow(0.62, i));
+// Fator de decaimento por posição — "Plano" reparte quase igual,
+// "Agressivo" concentra bem mais no topo. É o dropdown ao lado do "%"
+// na tela de premiação do pppoker.
+const PAYOUT_WEIGHT_DECAY = { flat: 0.85, standard: 0.62, aggressive: 0.45 };
+
+// Curva de pagamento: X% da BASE são premiados (mínimo 1), com pesos
+// decrescentes normalizados pra somar exatamente o total do prêmio.
+// "base" já vem calculada por tournamentItmBaseCount() — pode ser
+// contagem de jogadores ou de total de buy-ins, dependendo do
+// "Cálculo de ITM" escolhido na criação.
+function tournamentPayoutFractions(base, payoutPercent = 12, weighting = "standard") {
+  const paid = Math.max(1, Math.round(base * (Number(payoutPercent) / 100)) || 1);
+  const decay = PAYOUT_WEIGHT_DECAY[weighting] || PAYOUT_WEIGHT_DECAY.standard;
+  const weights = Array.from({ length: paid }, (_, i) => Math.pow(decay, i));
   const total = weights.reduce((a, b) => a + b, 0);
   return weights.map((w) => w / total);
+}
+
+// "Cálculo de ITM": Jogadores conta só quem entrou (sem contar
+// rebuy/add-on de novo); Total de buy-ins conta cada recompra e add-on
+// como uma entrada a mais — reflete o texto oficial do pppoker
+// ("...calculado com base no número de buy-ins, rebuys e add-ons").
+function tournamentItmBaseCount(activeEntries, itmMode) {
+  if (itmMode === "players") return activeEntries.length;
+  return activeEntries.reduce((s, e) => s + 1 + Number(e.rebuys || 0) + (e.addon_used ? 1 : 0), 0);
+}
+
+// K.O. Misterioso: quando o número de jogadores ainda em jogo cai pro
+// tamanho da fase ITM, sorteia de uma vez os prêmios que vão ser
+// distribuídos daqui pra frente (um por eliminação, até o heads-up) —
+// gerados por partição aleatória do pote acumulado (mystery_pool), não
+// uniforme, pra ter a variação de "sorte grande vs pequena" que o modo
+// promete. Guardado em advanced_flags.mysteryPrizes pra sobreviver um
+// restart do servidor. Simplificação assumida: o pppoker sorteia e
+// revela ao vivo, aqui o valor só é decidido no instante em que a fase
+// ITM é atingida.
+function generateMysteryPrizes(pool, count) {
+  if (count <= 0 || pool <= 0) return [];
+  const cuts = Array.from({ length: count - 1 }, () => Math.random()).sort((a, b) => a - b);
+  const bounds = [0, ...cuts, 1];
+  const shares = [];
+  for (let i = 0; i < count; i++) shares.push(bounds[i + 1] - bounds[i]);
+  // Maior fatia sempre embaralhada com as demais (não é sempre a
+  // última eliminação que leva o prêmio grande).
+  const values = shares.map((s) => Math.round(pool * s));
+  for (let i = values.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [values[i], values[j]] = [values[j], values[i]];
+  }
+  return values;
 }
 
 async function refundTournamentEntry(t, entry) {
@@ -270,7 +361,7 @@ async function startTournament(t) {
   const numTables = Math.max(1, Math.ceil(active.length / 9));
   const tables = Array.from({ length: numTables }, () => new PokerTable({ smallBlind: 0, bigBlind: 0, rakePercent: 0, variant: t.variant }));
   active.forEach((e, i) => tables[i % numTables].addPlayer(e.username, e.username, Number(e.chips), false));
-  const level = tournamentBlindLevel(t.starting_chips, 0);
+  const level = tournamentBlindLevel(t, 0);
   for (const table of tables) { table.smallBlind = level.sb; table.bigBlind = level.bb; }
   tables.forEach((table, idx) => {
     const code = tournamentTableCode(clubCode, t.id, idx);
@@ -282,6 +373,12 @@ async function startTournament(t) {
     table.tournamentBuyIn = Number(t.buy_in);
     table.tournamentStartingChips = Number(t.starting_chips);
     table.tournamentRebuyAllowed = !!t.rebuy_allowed;
+    // Opções avançadas do torneio (Banir bate-papo / Ver Cartas
+    // Descartadas) — mesmo par de flags que a mesa cash já usa,
+    // só que lidas de tournaments.advanced_flags em vez de club_tables.
+    const tFlags = t.advanced_flags || {};
+    rt.chatBanned = !!tFlags.chatBanned;
+    rt.showFoldedCards = tFlags.showFoldedCards !== false;
     rt.tournamentId = t.id;
     rt.pendingLeave = new Set();
   });
@@ -315,7 +412,9 @@ async function finishTournament(t) {
   // já que ele nunca é eliminado) continua disponível aqui.
   const totalBountyPaid = finalEntries.reduce((s, e) => s + Number(e.bounty_won || 0), 0);
   const prizePool = Math.max(Number(t.gtd_prize) || 0, totalBuyIns - totalBountyPaid);
-  const fractions = tournamentPayoutFractions(finalEntries.filter((e) => e.status !== "cancelled").length, Number(t.payout_percent) || 12);
+  const activeFinal = finalEntries.filter((e) => e.status !== "cancelled");
+  const itmBase = tournamentItmBaseCount(activeFinal, t.itm_mode || "buyins");
+  const fractions = tournamentPayoutFractions(itmBase, Number(t.payout_percent) || 12, t.payout_weighting || "standard");
   for (let i = 0; i < fractions.length && i < paidEntries.length; i++) {
     const prize = Math.round(prizePool * fractions[i]);
     if (prize <= 0) continue;
@@ -330,10 +429,73 @@ async function finishTournament(t) {
     // Carreira: prêmio ganho é ficha real do clube de verdade.
     await recordHandLedger(t.club_id, null, paidEntries[i].user_id, prize);
   }
+  // K.O. Progressivo: o campeão nunca é eliminado, então o pote de
+  // bounty PRÓPRIO dele (que só cresceu a cada eliminação que ele fez)
+  // nunca foi pago — paga pra ele agora, à parte da premiação por
+  // colocação.
+  if (t.ko_mode === "progressive" && paidEntries[0]) {
+    const champion = await getTournamentEntry(t.id, paidEntries[0].user_id);
+    const leftover = Number(champion?.bounty_pool || 0);
+    if (leftover > 0) {
+      await adjustMemberChips(t.club_id, paidEntries[0].user_id, leftover);
+      await adjustClubTreasury(t.club_id, -leftover);
+      await recordHandLedger(t.club_id, null, paidEntries[0].user_id, leftover);
+    }
+  }
+  // K.O. Misterioso: se sobrou pote sem sortear (torneio acabou rápido
+  // demais pra consumir todos os prêmios sorteados, ou nunca chegou a
+  // sortear), o resto vai pro campeão — não pode ficar perdido dentro
+  // da tesouraria sem dono.
+  if (t.ko_mode === "mystery" && paidEntries[0]) {
+    const leftoverPool = Number(t.mystery_pool || 0);
+    if (leftoverPool > 0) {
+      await adjustMemberChips(t.club_id, paidEntries[0].user_id, leftoverPool);
+      await adjustClubTreasury(t.club_id, -leftoverPool);
+      await recordHandLedger(t.club_id, null, paidEntries[0].user_id, leftoverPool);
+    }
+  }
   await updateTournament(t.id, { status: "finished", finishedAt: new Date().toISOString() });
   // Limpa os runtimes das mesas desse torneio.
   for (const [code, rt] of runtime.entries()) {
     if (rt.tournamentId === t.id) runtime.delete(code);
+  }
+  await scheduleRecurringTournament(t);
+}
+
+// "MTT recorrente": cria automaticamente o próximo torneio com a MESMA
+// configuração, no próximo dia da semana marcado em
+// advanced_flags.recurring.days (0=domingo...6=sábado), no mesmo
+// horário do torneio que acabou de terminar. Simplificação assumida:
+// não tem a tela "Padrões de mesa" do pppoker pra listar/pausar/excluir
+// os recorrentes separadamente — cada novo torneio criado aparece na
+// lista normal de Torneios do clube, e pra parar a recorrência é só
+// editar esse novo torneio e desligar a opção antes dele também acabar.
+async function scheduleRecurringTournament(t) {
+  const flags = t.advanced_flags || {};
+  const rec = flags.recurring;
+  if (!rec?.enabled || !Array.isArray(rec.days) || rec.days.length === 0) return;
+  try {
+    const prevStart = new Date(t.start_time);
+    let next = new Date(prevStart.getTime());
+    for (let i = 1; i <= 14; i++) {
+      next = new Date(prevStart.getTime() + i * 86400000);
+      if (rec.days.includes(next.getDay())) break;
+    }
+    await createTournament({
+      clubId: t.club_id, name: t.name, variant: t.variant, buyIn: Number(t.buy_in), startingChips: Number(t.starting_chips),
+      maxPlayers: t.max_players, minPlayers: t.min_players, blindStructure: t.blind_structure, levelMinutes: t.level_minutes,
+      lateRegMinutes: t.late_reg_minutes, rebuyAllowed: t.rebuy_allowed, rebuyMax: t.rebuy_max, gtdPrize: Number(t.gtd_prize),
+      startTime: next.toISOString(), createdBy: t.created_by,
+      earlyBirdDiscountPct: t.early_bird_discount_pct, earlyBirdDeadline: null,
+      bountyEnabled: t.bounty_enabled, bountyPercent: t.bounty_percent, payoutPercent: t.payout_percent,
+      rebuyMultiplier: t.rebuy_multiplier, rebuyDouble: t.rebuy_double, rebuyTriple: t.rebuy_triple,
+      addonEnabled: t.addon_enabled, addonMultiplier: t.addon_multiplier, addonDouble: t.addon_double, addonTriple: t.addon_triple,
+      addonPauseMinutes: t.addon_pause_minutes, koMode: t.ko_mode, itmMode: t.itm_mode, payoutWeighting: t.payout_weighting,
+      earlyBirdChipBonusPct: t.early_bird_chip_bonus_pct, earlyBirdChipBonusLevel: t.early_bird_chip_bonus_level,
+      lateRegLevel: t.late_reg_level, customBlindLevels: t.custom_blind_levels, advancedFlags: flags,
+    });
+  } catch (err) {
+    console.error(`Erro criando MTT recorrente a partir do torneio #${t.id}:`, err.message);
   }
 }
 
@@ -341,6 +503,89 @@ async function finishTournament(t) {
 // zerou como eliminado (com a colocação certa) e verifica se o torneio
 // já deve terminar. Chamado depois de cada broadcastTable de uma mesa
 // marcada como isTournament.
+// Paga o prêmio de K.O. de acordo com o modo escolhido na criação do
+// torneio (t.ko_mode), chamado uma vez por jogador eliminado, com quem
+// eliminou já identificado (eliminatorUser pode ser null se não achou
+// ninguém — nesse caso não paga nada em nenhum modo).
+// - "regular": paga o valor cheio na hora, sempre a mesma % do buy-in.
+// - "progressive": só metade do POTE PRÓPRIO da vítima vai pro
+//   eliminador agora; a outra metade entra no pote do eliminador (só é
+//   pago quando ELE for eliminado, ou devolvido a ele no fim se virar
+//   campeão — ver finishTournament).
+// - "mystery": nenhum prêmio antes da fase ITM (só acumula em
+//   tournaments.mystery_pool); ao entrar na fase ITM, sorteia de uma vez
+//   os prêmios das eliminações restantes (generateMysteryPrizes) e paga
+//   um por eliminação daí em diante.
+async function payKnockoutBounty(t, eliminatorUser, victimEntry, activeEntriesBeforeThis) {
+  const mode = t.bounty_enabled ? (t.ko_mode || "regular") : "off";
+  if (mode === "off" || !eliminatorUser) return;
+  const bountyAmount = Math.round(Number(t.buy_in) * Number(t.bounty_percent) / 100);
+  if (bountyAmount <= 0) return;
+
+  const payEliminator = async (amount) => {
+    if (amount <= 0) return;
+    await adjustMemberChips(t.club_id, eliminatorUser.id, amount);
+    await adjustClubTreasury(t.club_id, -amount);
+    const eliminatorEntry = await getTournamentEntry(t.id, eliminatorUser.id);
+    await updateTournamentEntry(t.id, eliminatorUser.id, { bounty_won: Number(eliminatorEntry?.bounty_won || 0) + amount });
+    // Carreira: bounty ganho é ficha real do clube de verdade.
+    await recordHandLedger(t.club_id, null, eliminatorUser.id, amount);
+  };
+
+  if (mode === "regular") {
+    await payEliminator(bountyAmount);
+    return;
+  }
+
+  if (mode === "progressive") {
+    // Se a vítima nunca fez rebuy (pote ainda não foi semeado por algum
+    // motivo), cai pro valor cheio do buy-in atual, igual o Regular.
+    const victimPool = Number(victimEntry?.bounty_pool || 0) || bountyAmount;
+    const half = Math.round(victimPool / 2);
+    await payEliminator(half);
+    const eliminatorEntry = await getTournamentEntry(t.id, eliminatorUser.id);
+    await updateTournamentEntry(t.id, eliminatorUser.id, { bounty_pool: Number(eliminatorEntry?.bounty_pool || 0) + (victimPool - half) });
+    return;
+  }
+
+  if (mode === "mystery") {
+    const paidSpots = Math.max(1, Math.round(
+      tournamentItmBaseCount(activeEntriesBeforeThis, t.itm_mode || "buyins") * (Number(t.payout_percent) || 12) / 100
+    ));
+    // Ainda longe da fase ITM: só acumula, sem sortear nem pagar nada.
+    if (activeEntriesBeforeThis.length > paidSpots) {
+      const pool = Number(t.mystery_pool || 0) + bountyAmount;
+      await updateTournament(t.id, { mystery_pool: pool });
+      t.mystery_pool = pool;
+      return;
+    }
+    const flags = t.advanced_flags || {};
+    let prizes = flags.mysteryPrizes;
+    if (!Array.isArray(prizes)) {
+      // Primeira eliminação já dentro (ou entrando agora) na fase ITM —
+      // sorteia de uma vez os prêmios de todas as eliminações que ainda
+      // faltam até o heads-up, com o pote acumulado até aqui + essa.
+      const pool = Number(t.mystery_pool || 0) + bountyAmount;
+      const slots = Math.max(1, activeEntriesBeforeThis.length - 1);
+      prizes = generateMysteryPrizes(pool, slots);
+      await updateTournament(t.id, { advanced_flags: { ...flags, mysteryPrizes: prizes }, mystery_pool: 0 });
+      t.advanced_flags = { ...flags, mysteryPrizes: prizes };
+      t.mystery_pool = 0;
+    } else {
+      // Sorteio já feito — contribuições depois disso (rebuy/add-on late)
+      // só voltam a acumular; são devolvidas ao campeão no fim.
+      const pool = Number(t.mystery_pool || 0) + bountyAmount;
+      await updateTournament(t.id, { mystery_pool: pool });
+      t.mystery_pool = pool;
+    }
+    const prizeValue = prizes.length ? prizes.shift() : 0;
+    await updateTournament(t.id, { advanced_flags: { ...(t.advanced_flags || {}), mysteryPrizes: [...prizes] } });
+    t.advanced_flags = { ...(t.advanced_flags || {}), mysteryPrizes: [...prizes] };
+    await payEliminator(prizeValue);
+    return;
+  }
+}
+
 async function pulseTournamentTable(code) {
   const rt = runtime.get(code);
   if (!rt?.isTournament || !rt.table) return;
@@ -368,7 +613,6 @@ async function pulseTournamentTable(code) {
     // Acha o "eliminador" pela maior variação positiva de fichas nessa
     // mesma mão (aproximação razoável sem rastrear mão a mão quem
     // apostou contra quem).
-    const bountyAmount = t.bounty_enabled ? Math.round(Number(t.buy_in) * Number(t.bounty_percent) / 100) : 0;
     const deltas = table.lastHandDeltas || {};
     for (const p of table.players) {
       // p.id na mesa é o NOME do jogador (username) — mas
@@ -381,21 +625,13 @@ async function pulseTournamentTable(code) {
       if (!puser) continue;
       if (p.chips > 0) { await updateTournamentEntry(t.id, puser.id, { chips: p.chips }); continue; }
       const remaining = stillPlaying.length; // quantos ainda restavam de verdade nesse instante
+      const victimEntry = await getTournamentEntry(t.id, puser.id);
       await updateTournamentEntry(t.id, puser.id, { status: "eliminated", chips: 0, rank: remaining, eliminatedAt: new Date().toISOString() });
-      if (bountyAmount > 0) {
+      if (t.bounty_enabled) {
         const survivors = table.players.filter((q) => q.id !== p.id && q.chips > 0);
         const eliminator = survivors.sort((a, b) => (deltas[b.id] || 0) - (deltas[a.id] || 0))[0];
-        if (eliminator) {
-          const eliminatorUser = await findUserByUsername(eliminator.id);
-          if (eliminatorUser) {
-            await adjustMemberChips(t.club_id, eliminatorUser.id, bountyAmount);
-            await adjustClubTreasury(t.club_id, -bountyAmount);
-            const eliminatorEntry = await getTournamentEntry(t.id, eliminatorUser.id);
-            await updateTournamentEntry(t.id, eliminatorUser.id, { bounty_won: Number(eliminatorEntry?.bounty_won || 0) + bountyAmount });
-            // Carreira: bounty ganho é ficha real do clube de verdade.
-            await recordHandLedger(t.club_id, null, eliminatorUser.id, bountyAmount);
-          }
-        }
+        const eliminatorUser = eliminator ? await findUserByUsername(eliminator.id) : null;
+        await payKnockoutBounty(t, eliminatorUser, victimEntry, stillPlaying);
       }
     }
     table.players = table.players.filter((p) => p.chips > 0);
@@ -463,7 +699,7 @@ async function tickTournaments() {
         const startedAt = t.level_started_at ? new Date(t.level_started_at).getTime() : now;
         if (now - startedAt < levelMs) continue;
         const nextLevel = Number(t.current_level) + 1;
-        const blinds = tournamentBlindLevel(t.starting_chips, nextLevel);
+        const blinds = tournamentBlindLevel(t, nextLevel);
         let tableIdx = 0;
         for (const [code, rt] of runtime.entries()) {
           if (rt.tournamentId !== t.id || !rt.table) continue;
@@ -1728,11 +1964,18 @@ async function handleMessage(ws, msg, ctx) {
     if (!requireAuth(ws, ctx)) return;
     const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
-    const list = await listClubTournaments(club.id);
+    const me = await getMember(club.id, ws.userId);
+    const viewerIsOwner = me?.role === "owner" || me?.role === "agent";
+    const list = (await listClubTournaments(club.id))
+      // "Mesa exclusiva" some da lista pra quem não é dono/gestor —
+      // igual já funciona pra mesa cash.
+      .filter((t) => !(t.advanced_flags || {}).exclusive || viewerIsOwner);
     const withCounts = await Promise.all(list.map(async (t) => {
       const entries = await listTournamentEntries(t.id);
       const mine = entries.find((e) => e.user_id === ws.userId);
-      return publicTournament(t, entries, mine, ws.username);
+      const pub = publicTournament(t, entries, mine, ws.username);
+      pub.pendingRegCount = viewerIsOwner ? (tournamentPendingRegs.get(t.id) || []).length : 0;
+      return pub;
     }));
     ctx.reply({ ok: true, tournaments: withCounts });
     return;
@@ -1746,15 +1989,53 @@ async function handleMessage(ws, msg, ctx) {
     if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
     const variant = msg.variant;
     if (!QUICK_VARIANTS[variant]) return ctx.reply({ ok: false, error: "Tipo de jogo inválido." });
-    if (!BLIND_SPEED_MINUTES[msg.blindStructure]) return ctx.reply({ ok: false, error: "Estrutura de blind inválida." });
+    if (!BLIND_STRUCTURES[msg.blindStructure]) return ctx.reply({ ok: false, error: "Estrutura de blind inválida." });
     const name = String(msg.name || "").trim().slice(0, 60) || "Torneio sem nome";
     const buyIn = Math.max(0, Number(msg.buyIn) || 0);
     const startingChips = Math.max(100, Number(msg.startingChips) || 10000);
-    const maxPlayers = Math.min(90, Math.max(2, Number(msg.maxPlayers) || 90));
+    // "Máx. de jogadores: 7.000" — igual ao limite do pppoker (a versão
+    // antiga travava em 90, um resquício de quando torneio só rodava
+    // numa única mesa cheia).
+    const maxPlayers = Math.min(7000, Math.max(2, Number(msg.maxPlayers) || 90));
     const minPlayers = Math.min(maxPlayers, Math.max(2, Number(msg.minPlayers) || 2));
     const lateRegMinutes = Math.max(0, Number(msg.lateRegMinutes) || 0);
+    // Registro tardio por NÍVEL de blind (alternativa ao "por minutos"
+    // que já existia) — igual o "Reg. tardio: Nível de blind X" do
+    // pppoker. Quando preenchido, register_tournament confere por nível
+    // em vez de por tempo corrido.
+    const lateRegLevel = msg.lateRegLevel != null ? Math.max(0, Number(msg.lateRegLevel) || 0) : null;
     const rebuyAllowed = !!msg.rebuyAllowed;
     const rebuyMax = rebuyAllowed ? Math.max(1, Number(msg.rebuyMax) || 1) : 0;
+    // Rebuy: multiplicador (1.0x-3.0x) escala tanto o preço quanto as
+    // fichas iniciais; Duplo/Triplo escalam por cima disso de novo — o
+    // jogador paga N vezes o preço do rebuy e recebe N vezes as fichas.
+    const rebuyMultiplier = rebuyAllowed ? Math.min(3, Math.max(1, Number(msg.rebuyMultiplier) || 1)) : 1;
+    const rebuyDouble = rebuyAllowed && !!msg.rebuyDouble;
+    const rebuyTriple = rebuyAllowed && !rebuyDouble && !!msg.rebuyTriple;
+    const addonEnabled = !!msg.addonEnabled;
+    const addonMultiplier = addonEnabled ? Math.min(3, Math.max(1, Number(msg.addonMultiplier) || 1)) : 1;
+    const addonDouble = addonEnabled && !!msg.addonDouble;
+    const addonTriple = addonEnabled && !addonDouble && !!msg.addonTriple;
+    const addonPauseMinutes = Math.min(30, Math.max(1, Number(msg.addonPauseMinutes) || 5));
+    // K.O.: "off" (desligado) | "regular" | "progressive" | "mystery".
+    const koMode = ["off", "regular", "progressive", "mystery"].includes(msg.koMode) ? msg.koMode : "regular";
+    const itmMode = msg.itmMode === "players" ? "players" : "buyins";
+    const payoutWeighting = ["flat", "standard", "aggressive"].includes(msg.payoutWeighting) ? msg.payoutWeighting : "standard";
+    // "Personalizar>>" — tabela de níveis fixa, cada um {sb,bb,ante}.
+    // Validado com cuidado porque entra direto na fórmula de blind do
+    // torneio inteiro — um nível malformado travaria todo mundo.
+    let customBlindLevels = null;
+    if (Array.isArray(msg.customBlindLevels) && msg.customBlindLevels.length > 0) {
+      customBlindLevels = msg.customBlindLevels.slice(0, 60).map((lvl) => ({
+        sb: Math.max(0, Number(lvl?.sb) || 0), bb: Math.max(0, Number(lvl?.bb) || 0), ante: Math.max(0, Number(lvl?.ante) || 0),
+      })).filter((lvl) => lvl.bb > 0);
+      if (customBlindLevels.length === 0) customBlindLevels = null;
+    }
+    // Opções avançadas (mesa exclusiva, registro autorizado, banir
+    // chat, ver cartas descartadas, restrições, MTT recorrente, limite
+    // de Time Bank, Multi-Dias) — mesmo padrão de club_tables, tudo
+    // dentro de advanced_flags (JSONB) por simplicidade.
+    const advancedFlags = msg.advancedFlags && typeof msg.advancedFlags === "object" ? msg.advancedFlags : {};
     const gtdPrize = Math.max(0, Number(msg.gtdPrize) || 0);
     // A garantia (GTD) tem que sair de algum lugar se os buy-ins não
     // cobrirem o valor prometido — é a tesouraria do clube que cobre essa
@@ -1776,14 +2057,23 @@ async function handleMessage(ws, msg, ctx) {
     const earlyBirdDeadline = earlyBirdDiscountPct > 0 && earlyBirdHours > 0
       ? new Date(startTime.getTime() - earlyBirdHours * 3600000).toISOString()
       : null;
+    // Bônus de fichas iniciais do Early Bird — válido até o nível de
+    // blind escolhido (não até o mesmo horário-limite do desconto,
+    // porque o pppoker descreve esse bônus por NÍVEL, não por horário).
+    const earlyBirdChipBonusPct = Math.min(200, Math.max(0, Number(msg.earlyBirdChipBonusPct) || 0));
+    const earlyBirdChipBonusLevel = earlyBirdChipBonusPct > 0 ? Math.max(1, Number(msg.earlyBirdChipBonusLevel) || 1) : 0;
     const bountyEnabled = !!msg.bountyEnabled;
     const bountyPercent = bountyEnabled ? Math.min(90, Math.max(1, Number(msg.bountyPercent) || 50)) : 0;
+    // Aceita fração (12.5%) — igual as opções do pppoker (5/10/12.5/15/20).
     const payoutPercent = Math.min(50, Math.max(5, Number(msg.payoutPercent) || 12));
     const t = await createTournament({
       clubId: club.id, name, variant, buyIn, startingChips, maxPlayers, minPlayers,
-      blindStructure: msg.blindStructure, levelMinutes: BLIND_SPEED_MINUTES[msg.blindStructure],
+      blindStructure: msg.blindStructure, levelMinutes: BLIND_STRUCTURES[msg.blindStructure].levelMinutes,
       lateRegMinutes, rebuyAllowed, rebuyMax, gtdPrize, startTime: startTime.toISOString(), createdBy: ws.userId,
       earlyBirdDiscountPct, earlyBirdDeadline, bountyEnabled, bountyPercent, payoutPercent,
+      rebuyMultiplier, rebuyDouble, rebuyTriple, addonEnabled, addonMultiplier, addonDouble, addonTriple, addonPauseMinutes,
+      koMode, itmMode, payoutWeighting, earlyBirdChipBonusPct, earlyBirdChipBonusLevel, lateRegLevel,
+      customBlindLevels, advancedFlags,
     });
     ctx.reply({ ok: true, tournamentId: t.id });
     return;
@@ -1840,12 +2130,19 @@ async function handleMessage(ws, msg, ctx) {
     if (!t) return ctx.reply({ ok: false, error: "Torneio não encontrado." });
     if (t.status !== "scheduled" && t.status !== "running") return ctx.reply({ ok: false, error: "Esse torneio não está aceitando inscrições." });
     if (t.status === "running") {
-      const startedRunningAt = t.level_started_at ? new Date(t.level_started_at).getTime() : Date.now();
-      // Aproximação razoável: inscrição tardia conta a partir do início
-      // do torneio, não do nível atual — usamos created_at como início.
-      const tournamentStartedAt = new Date(t.start_time).getTime();
-      if (Date.now() > tournamentStartedAt + Number(t.late_reg_minutes) * 60000) {
-        return ctx.reply({ ok: false, error: "Inscrição tardia já encerrou." });
+      // Registro tardio por NÍVEL de blind, quando configurado assim na
+      // criação — tem prioridade sobre o "por minutos" de baixo.
+      if (t.late_reg_level != null) {
+        if (Number(t.current_level || 0) > Number(t.late_reg_level)) {
+          return ctx.reply({ ok: false, error: "Inscrição tardia já encerrou." });
+        }
+      } else {
+        // Aproximação razoável: inscrição tardia conta a partir do início
+        // do torneio, não do nível atual — usamos created_at como início.
+        const tournamentStartedAt = new Date(t.start_time).getTime();
+        if (Date.now() > tournamentStartedAt + Number(t.late_reg_minutes) * 60000) {
+          return ctx.reply({ ok: false, error: "Inscrição tardia já encerrou." });
+        }
       }
     }
     const existing = await getTournamentEntry(t.id, ws.userId);
@@ -1853,6 +2150,30 @@ async function handleMessage(ws, msg, ctx) {
     const entries = await listTournamentEntries(t.id);
     const activeCount = entries.filter((e) => e.status !== "cancelled").length;
     if (activeCount >= t.max_players) return ctx.reply({ ok: false, error: "Torneio lotado." });
+    const flags = t.advanced_flags || {};
+    // "Restrição de IP": ninguém com o mesmo IP de quem já está
+    // inscrito nesse torneio consegue se inscrever também.
+    if (flags.ipRestriction && ws.remoteIp) {
+      const list = tournamentRegCoords.get(t.id) || [];
+      if (list.some((r) => r.userId !== ws.userId && r.ip && r.ip === ws.remoteIp)) {
+        return ctx.reply({ ok: false, error: "Restrição de IP: já tem alguém com esse mesmo IP inscrito nesse torneio." });
+      }
+    }
+    // "Restrição de GPS": exige lat/lng do cliente e recusa se tiver
+    // alguém inscrito mais perto que o mínimo configurado.
+    if (flags.gpsRestriction) {
+      const minMeters = Number(flags.gpsMinMeters) || 100;
+      if (!(msg.lat != null && msg.lng != null)) {
+        return ctx.reply({ ok: false, error: "Esse torneio exige localização pra se inscrever — ative o GPS e tenta de novo." });
+      }
+      const list = tournamentRegCoords.get(t.id) || [];
+      for (const r of list) {
+        if (r.userId === ws.userId || r.lat == null) continue;
+        if (haversineMeters(msg.lat, msg.lng, r.lat, r.lng) < minMeters) {
+          return ctx.reply({ ok: false, error: "Restrição de GPS: tem alguém inscrito perto demais desse torneio." });
+        }
+      }
+    }
     // Early Bird: desconto no buy-in pra quem se inscrever antes do
     // prazo-limite guardado na criação do torneio.
     const earlyBirdActive = t.early_bird_deadline && Date.now() < new Date(t.early_bird_deadline).getTime();
@@ -1861,14 +2182,106 @@ async function handleMessage(ws, msg, ctx) {
       : Number(t.buy_in);
     const member = await getMember(t.club_id, ws.userId);
     if (!member || Number(member.chips) < chargedBuyIn) return ctx.reply({ ok: false, error: "Saldo insuficiente pra esse buy-in." });
+    // "Registro autorizado": em vez de sentar direto, entra numa fila
+    // pro dono/gestor aprovar — não cobra nada até ser aprovado.
+    if (flags.registrationApproval) {
+      const me = await getMember(t.club_id, ws.userId);
+      const isAdmin = me && (me.role === "owner" || me.role === "agent");
+      if (!isAdmin) {
+        const list = tournamentPendingRegs.get(t.id) || [];
+        if (list.some((r) => r.userId === ws.userId)) return ctx.reply({ ok: false, error: "Seu pedido já está aguardando aprovação." });
+        list.push({ userId: ws.userId, username: ws.username, avatar: member.avatar, requestedAt: Date.now() });
+        tournamentPendingRegs.set(t.id, list);
+        ctx.reply({ ok: true, pendingApproval: true });
+        return;
+      }
+    }
+    // Bônus de fichas iniciais do Early Bird — vale até o nível de blind
+    // configurado (independe do prazo do desconto, que é por horário).
+    const chipBonusActive = Number(t.early_bird_chip_bonus_pct || 0) > 0
+      && Number(t.current_level || 0) <= Number(t.early_bird_chip_bonus_level || 0);
+    const grantedChips = chipBonusActive
+      ? Math.round(Number(t.starting_chips) * (1 + Number(t.early_bird_chip_bonus_pct) / 100))
+      : Number(t.starting_chips);
     await adjustMemberChips(t.club_id, ws.userId, -chargedBuyIn);
     await adjustClubTreasury(t.club_id, chargedBuyIn);
-    await addTournamentEntry(t.id, ws.userId, Number(t.starting_chips), chargedBuyIn);
+    await addTournamentEntry(t.id, ws.userId, grantedChips, chargedBuyIn);
+    // K.O. Progressivo: semeia o pote próprio do jogador com o valor
+    // cheio do bounty — cresce a partir daqui a cada eliminação que ele
+    // fizer (ver payKnockoutBounty).
+    if (t.bounty_enabled && t.ko_mode === "progressive") {
+      const seed = Math.round(Number(t.buy_in) * Number(t.bounty_percent) / 100);
+      if (seed > 0) await updateTournamentEntry(t.id, ws.userId, { bounty_pool: seed });
+    }
+    if (flags.ipRestriction || flags.gpsRestriction) {
+      const list = tournamentRegCoords.get(t.id) || [];
+      list.push({ userId: ws.userId, ip: ws.remoteIp || null, lat: msg.lat ?? null, lng: msg.lng ?? null });
+      tournamentRegCoords.set(t.id, list);
+    }
     // Carreira: registra o buy-in pago como perda (fichas REAIS do clube,
     // não a pilha de fichas do torneio — essa é só um número interno do
     // jogo, não corresponde a dinheiro de verdade).
     await recordHandLedger(t.club_id, null, ws.userId, -chargedBuyIn);
-    ctx.reply({ ok: true, earlyBird: earlyBirdActive, charged: chargedBuyIn });
+    ctx.reply({ ok: true, earlyBird: earlyBirdActive, charged: chargedBuyIn, chipBonus: chipBonusActive, chips: grantedChips });
+    return;
+  }
+
+  if (type === "list_tournament_registration_requests") {
+    if (!requireAuth(ws, ctx)) return;
+    const t = await getTournamentById(Number(msg.tournamentId));
+    if (!t) return ctx.reply({ ok: false, error: "Torneio não encontrado." });
+    const me = await getMember(t.club_id, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
+    const list = tournamentPendingRegs.get(t.id) || [];
+    ctx.reply({ ok: true, requests: list.map((r) => ({ username: r.username, avatar: r.avatar })) });
+    return;
+  }
+
+  if (type === "approve_tournament_registration") {
+    if (!requireAuth(ws, ctx)) return;
+    const t = await getTournamentById(Number(msg.tournamentId));
+    if (!t) return ctx.reply({ ok: false, error: "Torneio não encontrado." });
+    const me = await getMember(t.club_id, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
+    const list = tournamentPendingRegs.get(t.id) || [];
+    const idx = list.findIndex((r) => r.username === msg.username);
+    if (idx === -1) return ctx.reply({ ok: false, error: "Pedido não encontrado (talvez já tenha expirado)." });
+    const [req] = list.splice(idx, 1);
+    tournamentPendingRegs.set(t.id, list);
+    const member = await getMember(t.club_id, req.userId);
+    const chargedBuyIn = t.early_bird_deadline && Date.now() < new Date(t.early_bird_deadline).getTime()
+      ? Math.round(Number(t.buy_in) * (1 - Number(t.early_bird_discount_pct) / 100)) : Number(t.buy_in);
+    if (!member || Number(member.chips) < chargedBuyIn) {
+      pushToUser(req.userId, { type: "toast", message: "Seu pedido foi aprovado, mas seu saldo caiu abaixo do buy-in — não deu pra confirmar a inscrição." });
+      return ctx.reply({ ok: false, error: "Saldo do jogador ficou insuficiente nesse meio-tempo." });
+    }
+    await adjustMemberChips(t.club_id, req.userId, -chargedBuyIn);
+    await adjustClubTreasury(t.club_id, chargedBuyIn);
+    await addTournamentEntry(t.id, req.userId, Number(t.starting_chips), chargedBuyIn);
+    if (t.bounty_enabled && t.ko_mode === "progressive") {
+      const seed = Math.round(Number(t.buy_in) * Number(t.bounty_percent) / 100);
+      if (seed > 0) await updateTournamentEntry(t.id, req.userId, { bounty_pool: seed });
+    }
+    await recordHandLedger(t.club_id, null, req.userId, -chargedBuyIn);
+    pushToUser(req.userId, { type: "toast", message: `Sua inscrição em "${t.name}" foi aprovada.` });
+    ctx.reply({ ok: true });
+    return;
+  }
+
+  if (type === "decline_tournament_registration") {
+    if (!requireAuth(ws, ctx)) return;
+    const t = await getTournamentById(Number(msg.tournamentId));
+    if (!t) return ctx.reply({ ok: false, error: "Torneio não encontrado." });
+    const me = await getMember(t.club_id, ws.userId);
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão." });
+    const list = tournamentPendingRegs.get(t.id) || [];
+    const idx = list.findIndex((r) => r.username === msg.username);
+    if (idx !== -1) {
+      const [req] = list.splice(idx, 1);
+      tournamentPendingRegs.set(t.id, list);
+      pushToUser(req.userId, { type: "toast", message: `Sua inscrição em "${t.name}" foi recusada.` });
+    }
+    ctx.reply({ ok: true });
     return;
   }
 
@@ -1883,6 +2296,10 @@ async function handleMessage(ws, msg, ctx) {
     await adjustMemberChips(t.club_id, ws.userId, refundAmount);
     await adjustClubTreasury(t.club_id, -refundAmount);
     await removeTournamentEntry(t.id, ws.userId);
+    const coordList = tournamentRegCoords.get(t.id);
+    if (coordList) tournamentRegCoords.set(t.id, coordList.filter((r) => r.userId !== ws.userId));
+    const pendingList = tournamentPendingRegs.get(t.id);
+    if (pendingList) tournamentPendingRegs.set(t.id, pendingList.filter((r) => r.userId !== ws.userId));
     // Desfaz o -buyIn que tinha sido registrado na carreira ao se inscrever.
     await recordHandLedger(t.club_id, null, ws.userId, refundAmount);
     ctx.reply({ ok: true });
@@ -2468,8 +2885,15 @@ async function handleMessage(ws, msg, ctx) {
     if (!entry) return ctx.reply({ ok: false, error: "Você não está inscrito nesse torneio." });
     if (entry.status !== "eliminated") return ctx.reply({ ok: false, error: "Só dá pra recomprar depois de ser eliminado." });
     if (Number(entry.rebuys || 0) >= Number(t.rebuy_max)) return ctx.reply({ ok: false, error: "Limite de recompras atingido." });
+    // Multiplicador (1.0x-3.0x) vezes Duplo/Triplo, igual o texto oficial
+    // do pppoker: "no rebuy duplo, os jogadores pagam duas vezes o preço
+    // do rebuy e recebem as fichas iniciais multiplicadas" pelo mesmo
+    // fator do multiplicador escolhido.
+    const factor = Number(t.rebuy_multiplier || 1) * (t.rebuy_triple ? 3 : t.rebuy_double ? 2 : 1);
+    const price = Math.round(Number(t.buy_in) * factor);
+    const chipsGranted = Math.round(Number(t.starting_chips) * factor);
     const member = await getMember(t.club_id, ws.userId);
-    if (!member || Number(member.chips) < Number(t.buy_in)) return ctx.reply({ ok: false, error: "Saldo insuficiente pra recomprar." });
+    if (!member || Number(member.chips) < price) return ctx.reply({ ok: false, error: "Saldo insuficiente pra recomprar." });
     // A mesa dele especificamente ainda deveria existir (o torneio como
     // um todo está "running") — se não existir por algum motivo
     // inesperado, avisa direito em vez de travar numa mensagem genérica.
@@ -2479,22 +2903,89 @@ async function handleMessage(ws, msg, ctx) {
     }
     if (!code) return ctx.reply({ ok: false, error: "Não achei nenhuma mesa aberta desse torneio pra te sentar de volta." });
     const rt = runtime.get(code);
-    await adjustMemberChips(t.club_id, ws.userId, -Number(t.buy_in));
-    await adjustClubTreasury(t.club_id, Number(t.buy_in));
+    await adjustMemberChips(t.club_id, ws.userId, -price);
+    await adjustClubTreasury(t.club_id, price);
     await updateTournamentEntry(t.id, ws.userId, {
-      status: "playing", chips: Number(t.starting_chips), rank: null,
-      rebuys: Number(entry.rebuys || 0) + 1, buy_in_paid: Number(entry.buy_in_paid || t.buy_in) + Number(t.buy_in),
+      status: "playing", chips: chipsGranted, rank: null,
+      rebuys: Number(entry.rebuys || 0) + 1, buy_in_paid: Number(entry.buy_in_paid || t.buy_in) + price,
     });
+    // K.O. Progressivo: o rebuy também alimenta o pote próprio (senão
+    // quem recompra várias vezes ficaria eliminando de graça); K.O.
+    // Misterioso: soma no pote acumulado do torneio.
+    if (t.bounty_enabled && t.ko_mode === "progressive") {
+      const seed = Math.round(Number(t.buy_in) * factor * Number(t.bounty_percent) / 100);
+      if (seed > 0) await updateTournamentEntry(t.id, ws.userId, { bounty_pool: Number(entry.bounty_pool || 0) + seed });
+    } else if (t.bounty_enabled && t.ko_mode === "mystery") {
+      const seed = Math.round(Number(t.buy_in) * factor * Number(t.bounty_percent) / 100);
+      if (seed > 0) await updateTournament(t.id, { mystery_pool: Number(t.mystery_pool || 0) + seed });
+    }
     // Carreira: registra o custo da recompra como perda, em fichas REAIS
     // do clube (não a pilha de fichas do torneio).
-    await recordHandLedger(t.club_id, null, ws.userId, -Number(t.buy_in));
+    await recordHandLedger(t.club_id, null, ws.userId, -price);
     // pulseTournamentTable já tirou esse jogador de rt.table.players
     // quando ele zerou — precisa sentar ele de novo, com a pilha nova.
     if (!rt.table.players.some((p) => p.id === username)) {
-      rt.table.addPlayer(username, username, Number(t.starting_chips), false);
+      rt.table.addPlayer(username, username, chipsGranted, false);
     }
-    recordSessionBuyIn(rt.table, username, Number(t.buy_in));
-    ctx.reply({ ok: true, chips: Number(t.starting_chips), code });
+    recordSessionBuyIn(rt.table, username, price);
+    ctx.reply({ ok: true, chips: chipsGranted, code });
+    broadcastTable(code);
+    return;
+  }
+
+  if (type === "addon_tournament") {
+    if (!requireAuth(ws, ctx)) return;
+    const t = await getTournamentById(Number(msg.tournamentId));
+    if (!t) return ctx.reply({ ok: false, error: "Torneio não encontrado." });
+    if (!t.addon_enabled) return ctx.reply({ ok: false, error: "Esse torneio não tem add-on." });
+    if (t.status !== "running") return ctx.reply({ ok: false, error: "Esse torneio não está em andamento." });
+    const entry = await getTournamentEntry(t.id, ws.userId);
+    if (!entry) return ctx.reply({ ok: false, error: "Você não está inscrito nesse torneio." });
+    if (entry.status !== "playing") return ctx.reply({ ok: false, error: "Só dá pra fazer add-on enquanto ainda estiver na disputa." });
+    if (entry.addon_used) return ctx.reply({ ok: false, error: "Você já usou seu add-on nesse torneio." });
+    // Janela do add-on: só depois que o registro tardio encerrar (por
+    // nível ou por minutos, o que o torneio usar), até
+    // addon_pause_minutes depois disso. Simplificação assumida: o
+    // relógio de blind do torneio não pausa de verdade nessa janela
+    // (igual o pppoker descreve) — só a AÇÃO de add-on fica liberada
+    // nesse intervalo de tempo.
+    const tournamentStartedAt = new Date(t.start_time).getTime();
+    const lateRegEndsAt = t.late_reg_level != null
+      ? (Number(t.current_level || 0) > Number(t.late_reg_level) ? Date.now() : null)
+      : tournamentStartedAt + Number(t.late_reg_minutes) * 60000;
+    const windowOpen = lateRegEndsAt != null && Date.now() >= lateRegEndsAt;
+    const windowClose = lateRegEndsAt != null ? lateRegEndsAt + Number(t.addon_pause_minutes) * 60000 : null;
+    if (!windowOpen || (windowClose != null && Date.now() > windowClose)) {
+      return ctx.reply({ ok: false, error: "Add-on só pode ser feito na janela logo depois do fim do registro tardio." });
+    }
+    const factor = Number(t.addon_multiplier || 1) * (t.addon_triple ? 3 : t.addon_double ? 2 : 1);
+    const price = Math.round(Number(t.buy_in) * factor);
+    const chipsGranted = Math.round(Number(t.starting_chips) * factor);
+    const member = await getMember(t.club_id, ws.userId);
+    if (!member || Number(member.chips) < price) return ctx.reply({ ok: false, error: "Saldo insuficiente pro add-on." });
+    let code = null;
+    for (const [c, rt] of runtime.entries()) {
+      if (rt.tournamentId === t.id) { code = c; break; }
+    }
+    if (!code) return ctx.reply({ ok: false, error: "Não achei nenhuma mesa aberta desse torneio." });
+    const rt = runtime.get(code);
+    await adjustMemberChips(t.club_id, ws.userId, -price);
+    await adjustClubTreasury(t.club_id, price);
+    await updateTournamentEntry(t.id, ws.userId, {
+      addon_used: true, chips: Number(entry.chips || 0) + chipsGranted,
+      buy_in_paid: Number(entry.buy_in_paid || t.buy_in) + price,
+    });
+    if (t.bounty_enabled && t.ko_mode === "progressive") {
+      const seed = Math.round(price * Number(t.bounty_percent) / 100);
+      if (seed > 0) await updateTournamentEntry(t.id, ws.userId, { bounty_pool: Number(entry.bounty_pool || 0) + seed });
+    } else if (t.bounty_enabled && t.ko_mode === "mystery") {
+      const seed = Math.round(price * Number(t.bounty_percent) / 100);
+      if (seed > 0) await updateTournament(t.id, { mystery_pool: Number(t.mystery_pool || 0) + seed });
+    }
+    await recordHandLedger(t.club_id, null, ws.userId, -price);
+    const p = rt.table.players.find((pl) => pl.id === ws.username);
+    if (p) p.chips = Number(p.chips || 0) + chipsGranted;
+    ctx.reply({ ok: true, chips: Number(entry.chips || 0) + chipsGranted, code });
     broadcastTable(code);
     return;
   }
