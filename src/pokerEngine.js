@@ -249,6 +249,20 @@ function nextToActSeat(players, from) {
   for (let step = 1; step <= n; step++) { const i = (from + step) % n; const p = players[i]; if (p.inHand && !p.folded && !p.allIn) return i; }
   return -1;
 }
+// Reparte "amount" em "n" pedaços inteiros cuja soma é EXATAMENTE
+// "amount" (o resto vai um a um pros primeiros pedaços) — usado pelo
+// Run It Múltiplo pra dividir cada pote entre os N boards sem nunca
+// criar nem perder ficha no arredondamento.
+function splitIntoChunks(amount, n) {
+  const base = Math.floor(amount / n);
+  let remainder = amount - base * n;
+  const chunks = [];
+  for (let i = 0; i < n; i++) {
+    chunks.push(base + (remainder > 0 ? 1 : 0));
+    if (remainder > 0) remainder -= 1;
+  }
+  return chunks;
+}
 function activeInHand(players) { return players.filter((p) => p.inHand && !p.folded); }
 function needMoreAction(players) { return players.filter((p) => p.inHand && !p.folded && !p.allIn).length > 1; }
 
@@ -353,6 +367,20 @@ export class PokerTable {
     this.pendingRakeByPlayer = {}; // { playerId: quanto desse rake veio dele } — base do sistema de rakeback/comissão
     this.pendingPlatformRake = 0; // chips raked (parte do APP) na mão mais recente, ainda não gravados pelo caller
     this.allInRunout = false;
+    // Run It Múltiplo ("Bater 2x/3x") — reaproveita a config existente
+    // da mesa (this.runItMultiple, acima). Estado da decisão da mão
+    // ATUAL, resetado a cada startHand(): runItCount null = ainda não
+    // decidiu; runItPending true = esperando os jogadores votarem;
+    // runItBoards preenchido só quando o resultado foi >1 board.
+    this.runItPending = false;
+    this.runItOptions = null; // [1,2,3] — opções válidas nessa mão específica
+    this.runItChoices = {}; // { playerId: 1|2|3 }
+    this.runItInvolvedIds = null; // quem precisa votar (travado no momento do all-in)
+    this.runItCount = null;
+    this.runItBoards = null; // array de boards (cada um 5 cartas) quando runItCount > 1
+    this.runItBoardResults = null; // [{ playerId: fichasGanhasNesseBoard }, ...] por board
+    this.runItMismatch = false; // true por 1 broadcast: última rodada de voto não bateu
+    this.runItPendingSince = null;
     this.winProbs = {}; // { playerId: percentInteiro } — só preenchido durante all-in runout / showdown
     this.winningHandCards = {}; // { playerId: [5 cartas] } — só preenchido em showdown de verdade (não quando todo mundo desiste)
     // Resultado em tempo real por jogador nessa mesa (buy-in total vs
@@ -465,6 +493,15 @@ export class PokerTable {
     this.results = {};
     this.pot = sbAmt + bbAmt;
     this.allInRunout = false;
+    this.runItPending = false;
+    this.runItOptions = null;
+    this.runItChoices = {};
+    this.runItInvolvedIds = null;
+    this.runItCount = null;
+    this.runItBoards = null;
+    this.runItBoardResults = null;
+    this.runItMismatch = false;
+    this.runItPendingSince = null;
     this.winProbs = {};
     this.winningHandCards = {};
 
@@ -602,6 +639,31 @@ export class PokerTable {
     if (this.stage === "preflop" || this.stage === "flop" || this.stage === "turn") {
       const order = { preflop: "flop", flop: "turn", turn: "river" };
       const nextStage = order[this.stage];
+
+      // Ninguém que sobrou na mão tem mais NENHUMA decisão a tomar
+      // (all-in) e ainda falta pelo menos uma carta pra sair — esse é o
+      // momento exato de oferecer "Bater 2x/3x" (config existente da
+      // mesa, this.runItMultiple), ANTES de revelar a próxima carta.
+      // Só pergunta uma vez por mão (runItCount ainda null); se não
+      // for elegível (mesa desligada, 4+ envolvidos, ou baralho curto
+      // demais pra não repetir carta entre boards), marca runItCount=1
+      // e segue revelando do jeito de sempre, sem perguntar nada.
+      if (contenders.length > 1 && !stillNeedAction && this.runItCount === null) {
+        this.allInRunout = true;
+        this.winProbs = computeWinProbs(contenders, this.community, this.variant);
+        const options = contenders.length <= 3 ? this.runItAvailableOptions() : [1];
+        if (options.length > 1) {
+          this.runItPending = true;
+          this.runItOptions = options;
+          this.runItChoices = {};
+          this.runItInvolvedIds = contenders.map((p) => p.id);
+          this.runItPendingSince = Date.now();
+          this.addLog(`Todos all-in — aguardando escolha de Run It (${options.join("x/")}x).`);
+          return; // pausa aqui: nada mais é revelado até resolver a votação
+        }
+        this.runItCount = 1;
+      }
+
       const dealCount = nextStage === "flop" ? 3 : 1;
       for (let i = 0; i < dealCount; i++) this.community.push(this.deck.pop());
       this.stage = nextStage;
@@ -743,6 +805,167 @@ export class PokerTable {
     this.recordHandHistorySnapshot(contenders);
   }
 
+  // Quantas cartas comunitárias ainda faltam sair nessa mão.
+  runItCardsNeeded() { return Math.max(0, 5 - this.community.length); }
+
+  // Opções de Run It matematicamente possíveis AGORA (sempre inclui 1x
+  // = recusar/seguir normal). 2x/3x só entram se sobrar baralho
+  // suficiente pra nenhum board repetir carta com outro nem com o que
+  // já saiu — com poucos jogadores envolvidos (regra de ≤3 já filtrada
+  // por quem chama) isso quase sempre sobra, mas em variantes com mais
+  // cartas por mão (PLO6) uma mesa cheia pode não ter baralho de sobra.
+  runItAvailableOptions() {
+    const options = [1];
+    if (!this.runItMultiple) return options;
+    const need = this.runItCardsNeeded();
+    if (need <= 0) return options;
+    if (this.deck.length >= 2 * need) options.push(2);
+    if (this.deck.length >= 3 * need) options.push(3);
+    return options;
+  }
+
+  // Registra o voto de um jogador envolvido. Só executa quando TODOS os
+  // envolvidos escolheram a MESMA quantidade — senão avisa divergência
+  // e limpa os votos pra escolherem de novo (regra pedida: nada de
+  // maioria, tem que ser unânime).
+  submitRunItChoice(playerId, count) {
+    if (!this.runItPending) return { ok: false, error: "Não tem escolha de Run It pendente nessa mesa." };
+    if (!this.runItInvolvedIds?.includes(playerId)) return { ok: false, error: "Você não está envolvido nessa mão." };
+    if (!this.runItOptions?.includes(count)) return { ok: false, error: "Essa opção não está disponível." };
+    this.runItChoices[playerId] = count;
+    this.runItMismatch = false;
+    const allVoted = this.runItInvolvedIds.every((id) => this.runItChoices[id] != null);
+    if (!allVoted) return { ok: true, waiting: true };
+    const values = this.runItInvolvedIds.map((id) => this.runItChoices[id]);
+    const unanimous = values.every((v) => v === values[0]);
+    if (!unanimous) {
+      this.runItChoices = {};
+      this.runItMismatch = true;
+      return { ok: true, mismatch: true };
+    }
+    this.finalizeRunIt(values[0]);
+    return { ok: true, resolved: true };
+  }
+
+  // Todos concordaram (ou o tempo de espera estourou, ver index.js) —
+  // fecha a votação e ou segue revelando normal (1x) ou já resolve a
+  // mão inteira de uma vez, sorteando N boards distintos.
+  finalizeRunIt(count) {
+    this.runItPending = false;
+    this.runItCount = count;
+    this.runItPendingSince = null;
+    if (count <= 1) {
+      this.addLog("Run It: seguindo com um board só.");
+      return; // o próximo tick de needsAutoRunout() continua revelando normal
+    }
+    const need = this.runItCardsNeeded();
+    const boards = [];
+    for (let b = 0; b < count; b++) {
+      const extra = [];
+      for (let i = 0; i < need; i++) extra.push(this.deck.pop());
+      boards.push([...this.community, ...extra]);
+    }
+    this.runItBoards = boards;
+    // this.community aponta pro primeiro board — é o que o resto do
+    // client (histórico de mãos, banner de jackpot) já sabe ler; os
+    // outros ficam em runItBoards pra UI desenhar todos lado a lado.
+    this.community = boards[0];
+    this.addLog(`Run It ${count}x: gerando ${count} boards distintos.`);
+    this.resolveShowdownMultiBoard(boards);
+  }
+
+  // Igual resolveShowdownOrFold(), mas avalia cada pote em CADA board
+  // separadamente e reparte o valor (já sem rake) em fatias iguais — uma
+  // por board — antes de distribuir aos vencedores daquele board
+  // específico. splitIntoChunks garante que a soma das fatias bate
+  // exatamente com o valor original (nenhuma ficha criada nem perdida).
+  resolveShowdownMultiBoard(boards) {
+    const contenders = activeInHand(this.players);
+    const tags = {};
+    this.pendingRake = 0;
+    this.pendingPlatformRake = 0;
+    this.pendingRakeByPlayer = {};
+    this.winningHandCards = {};
+    this.runItBoardResults = boards.map(() => ({}));
+
+    const pots = this.pot > 0 ? computePots(this.players) : [];
+    const scoredByBoard = boards.map((board) => {
+      const scored = {};
+      contenders.forEach((p) => { scored[p.id] = bestHandFor(p.cards, board, this.variant); });
+      return scored;
+    });
+
+    // Jackpot do clube: detectado só no PRIMEIRO board. Simplificação
+    // assumida — não existe regra oficial de como o Jackpot se
+    // comportaria com múltiplos boards, e pagar uma vez por board
+    // sairia estranho/caro demais; o index.js já trata isso como um
+    // evento único por mão, igual sempre foi.
+    const holeCardsById = {};
+    contenders.forEach((p) => { holeCardsById[p.id] = p.cards; });
+    this.pendingJackpotEvent = detectJackpotEvent(scoredByBoard[0], contenders.map((p) => p.id), holeCardsById, this.variant);
+    this.pendingJackpotDealtIds = Object.keys(this.handStartChips || {});
+
+    const rakeCapChips = this.rakeCapBb > 0 ? Math.floor(this.rakeCapBb * this.bigBlind) : Infinity;
+    pots.forEach((potObj, potIdx) => {
+      // Rake calculado UMA vez sobre o pote inteiro — igual sempre foi,
+      // não depende de quantos boards estão rodando.
+      const rakeAmount = this.rakePercent > 0 ? Math.min(Math.floor((potObj.amount * this.rakePercent) / 100), rakeCapChips) : 0;
+      const distributable = potObj.amount - rakeAmount;
+      this.pendingRake += rakeAmount;
+      if (rakeAmount > 0) {
+        const contributorIds = Object.keys(potObj.contributions);
+        let assigned = 0;
+        contributorIds.forEach((id, i) => {
+          const isLast = i === contributorIds.length - 1;
+          const share = isLast ? rakeAmount - assigned : Math.floor((potObj.contributions[id] / potObj.amount) * rakeAmount);
+          assigned += share;
+          if (share > 0) this.pendingRakeByPlayer[id] = (this.pendingRakeByPlayer[id] || 0) + share;
+        });
+      }
+      const chunks = splitIntoChunks(distributable, boards.length);
+      boards.forEach((board, bIdx) => {
+        const chunkAmount = chunks[bIdx];
+        if (chunkAmount <= 0) return;
+        const scored = scoredByBoard[bIdx];
+        let bestScore = null, winners = [];
+        potObj.eligible.forEach((id) => {
+          const s = scored[id];
+          if (!bestScore || compareScores(s, bestScore) > 0) { bestScore = s; winners = [id]; }
+          else if (compareScores(s, bestScore) === 0) winners.push(id);
+        });
+        const share = Math.floor(chunkAmount / winners.length);
+        let remainder = chunkAmount - share * winners.length;
+        winners.forEach((id) => {
+          const pl = this.players.find((p) => p.id === id);
+          let amt = share; if (remainder > 0) { amt += 1; remainder -= 1; }
+          pl.chips += amt;
+          tags[id] = (tags[id] ? tags[id] + " + " : "+") + amt;
+          this.runItBoardResults[bIdx][id] = (this.runItBoardResults[bIdx][id] || 0) + amt;
+          if (!this.winningHandCards[id] && scored[id]?.cards) this.winningHandCards[id] = scored[id].cards;
+        });
+      });
+      const label = pots.length > 1 ? (potIdx === 0 ? "Pote principal" : `Side pot ${potIdx}`) : "Pote";
+      const rakeNote = rakeAmount > 0 ? ` (rake: ${rakeAmount})` : "";
+      this.addLog(`${label} (${potObj.amount}${rakeNote}) dividido em ${boards.length} boards do Run It.`);
+    });
+
+    this.winProbs = {};
+    contenders.forEach((p) => { this.winProbs[p.id] = tags[p.id] ? 100 : 0; });
+    this.results = tags;
+    this.stage = "showdown";
+    this.actingId = null;
+    this.lastHandDeltas = {};
+    this.lastHandVpip = {};
+    Object.keys(this.handStartChips || {}).forEach((id) => {
+      const p = this.players.find((pl) => pl.id === id);
+      if (!p) return;
+      const delta = p.chips - this.handStartChips[id];
+      if (delta !== 0) this.lastHandDeltas[id] = delta;
+      this.lastHandVpip[id] = !!p.vpipThisHand;
+    });
+    this.recordHandHistorySnapshot(contenders);
+  }
+
   // Guarda um retrato completo da mão que acabou de terminar — board,
   // cartas de quem foi a showdown (escondidas de quem só desistiu, igual
   // uma mesa de verdade), posição, resultado líquido — pra tela de
@@ -849,6 +1072,7 @@ export class PokerTable {
   }
 
   needsAutoRunout() {
+    if (this.runItPending) return false; // esperando os jogadores decidirem 1x/2x/3x
     if (this.actingId !== null) return false;
     // "river" faltava aqui — sem ele, uma mão que vai all-in cedo (todo
     // mundo sem mais decisão a tomar) ficava TRAVADA pra sempre bem no
@@ -878,6 +1102,18 @@ export class PokerTable {
       actingId: this.actingId,
       dealerId: this.dealerId,
       allInRunout: !!this.allInRunout,
+      // Run It Múltiplo ("Bater 2x/3x") — runItPending true = mostra o
+      // modal de escolha pros envolvidos; runItBoards preenchido só
+      // depois que todo mundo concordou em >1 e a mão já foi resolvida
+      // (boards extras, além do que já está em "community" = board 1).
+      runItPending: !!this.runItPending,
+      runItOptions: this.runItOptions || null,
+      runItChoices: this.runItChoices || {},
+      runItInvolvedIds: this.runItInvolvedIds || null,
+      runItCount: this.runItCount,
+      runItBoards: this.runItBoards || null,
+      runItBoardResults: this.runItBoardResults || null,
+      runItMismatch: !!this.runItMismatch,
       winProbs: this.winProbs || {},
       results: this.results,
       // Cartas exatas de quem ganhou algum pote nessa mão (5 cartas cada)

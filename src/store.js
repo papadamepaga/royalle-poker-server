@@ -7,7 +7,7 @@ import { pool, hasDatabase } from "./db.js";
 // doesn't need to know which backend it's talking to.
 // ---------------------------------------------------------------------
 
-export const AVATAR_OPTIONS = ["avatar_01", "avatar_02", "avatar_03"];
+export const AVATAR_OPTIONS = ["avatar_01", "avatar_02", "avatar_03", "royal-flush", "lion-king", "quad-aces", "spade-blaze", "whiskey-chips"];
 
 // ---- in-memory fallback ----
 const mem = {

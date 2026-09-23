@@ -657,10 +657,20 @@ async function pulseTournamentTable(code) {
 // isso, age por ele — passa se der de graça, senão desiste e marca
 // "ausente" na mesa (fica assim até ele mesmo agir nela de novo).
 const ACTION_GRACE_MS = 10000; // +10s de tolerância depois do "Tempo de ação" configurado da mesa
+// Se alguém desconectar ou simplesmente não votar em "Bater 2x/3x"
+// (precisa de TODOS os envolvidos), o jogo não pode travar pra sempre
+// esperando — depois desse tempo, resolve sozinho como 1x (segue
+// revelando normal, exatamente como se ninguém tivesse pedido Run It).
+const RUN_IT_VOTE_TIMEOUT_MS = 20000;
+
 function tickActionTimeouts() {
   const now = Date.now();
   for (const [code, rt] of runtime.entries()) {
     const table = rt.table;
+    if (table?.runItPending && table.runItPendingSince && now - table.runItPendingSince >= RUN_IT_VOTE_TIMEOUT_MS) {
+      table.finalizeRunIt(1);
+      broadcastTable(code);
+    }
     if (!table || !table.actingId) continue;
     const p = table.players.find((pl) => pl.id === table.actingId);
     if (!p || p.isBot) continue; // bots já têm o próprio relógio (pulseQuickTable)
@@ -2865,6 +2875,21 @@ async function handleMessage(ws, msg, ctx) {
     const result = rt.table.applyAction(username, msg.action, msg.amount);
     broadcastTable(code);
     ctx.reply(result?.error ? { ok: false, error: result.error } : { ok: true });
+    return;
+  }
+
+  if (type === "submit_run_it_choice") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const username = rt.socketToPlayer.get(ws);
+    if (!username) return ctx.reply({ ok: false, error: "Você não está sentado." });
+    const count = Number(msg.count);
+    const result = rt.table.submitRunItChoice(username, count);
+    if (!result.ok) return ctx.reply(result);
+    broadcastTable(code);
+    ctx.reply(result);
     return;
   }
 
