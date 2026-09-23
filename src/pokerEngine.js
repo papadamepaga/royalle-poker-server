@@ -306,71 +306,79 @@ function computeWinProbs(contenders, community, variant) {
 // Painel "Para vencer" (estilo GGPoker) — pra CADA jogador all-in,
 // calcula de verdade (reaproveitando bestHandFor/compareScores, o
 // MESMO avaliador de sempre, nada duplicado) quais cartas do baralho
-// restante fariam ELE vencer — não só melhorar a mão, VENCER de
-// verdade contra quem ainda disputa o(s) mesmo(s) pote(s) que ele
-// (side pot: só compara com quem tá elegível no mesmo pote, via
-// `pots`, igual o Run It já faz).
+// restante fariam ELE vencer/dividir algum pote que disputa (side pot:
+// só concorre pelo(s) pote(s) onde tá em `pot.eligible`, igual o Run
+// It já faz). Isso é uma funcionalidade informativa pra TODOS os
+// jogadores verem melhor o jogo — sem relação com o limite de 3
+// envolvidos do Run It Múltiplo (aquele é regra da votação de bater
+// 2x/3x; esse aqui não tem limite de gente).
 //
 // Só calcula quando falta 1 carta (turn já saiu, só o river) ou 2
 // (flop já saiu, faltam turn+river) — pré-flop (faltam 5) fica fora de
 // escopo, seria C(~46,5) combinações, inviável calcular síncrono no
-// servidor. Também limitado a ≤3 envolvidos, mesma regra do Run It
-// Múltiplo (o próprio pedido amarra os dois).
+// servidor.
 //
 // Simplificação assumida: uma carta que faz o jogador EMPATAR (não só
 // vencer sozinho) também entra no conjunto — o painel mostra "resultado
 // favorável", sem diferenciar visualmente vitória de chop nessa
 // primeira versão (dá pra refinar depois).
 //
-// Custo (medido): Hold'em/PLO4/5 fica bem rápido (<100ms). O pior caso
-// real é PLO6 com 3 jogadores all-in no FLOP (need=2, e cada
-// bestHandFor já é mais caro em Omaha) — testado isoladamente em
-// ~1,2s. É síncrono e bloqueia o processo Node inteiro durante esse
-// tempo (afetaria outras mesas rodando ao mesmo tempo). Não é ideal,
-// mas é raro (precisa mesa PLO6 cheia + 3 all-in exatos no flop) — se
-// virar problema de verdade, dá pra mover esse cálculo específico pra
-// um worker thread depois.
+// Desempenho: avalia cada jogador só UMA vez por board candidato (não
+// par-a-par por rival) — o custo cresce com nº de jogadores de forma
+// linear, não quadrática, então funciona liso mesmo em mesa cheia
+// (9-handed Hold'em no flop: ~500 boards × 9 avaliações ≈ 4500, poucas
+// dezenas de ms). PLO de mais jogadores consome mais baralho pra
+// dealing as mãos, então sobra MENOS carta pra enumerar — se
+// autolimita.
 export function computeWinningOuts(contenders, community, variant, deck, pots) {
   const result = {};
+  contenders.forEach((p) => { result[p.id] = { hasOuts: false, cards: [] }; });
   const need = 5 - community.length;
-  if (need <= 0 || need > 2 || contenders.length < 2 || contenders.length > 3) return result;
+  if (need <= 0 || need > 2 || contenders.length < 2) return result;
 
-  contenders.forEach((hero) => {
-    // Só entra na conta quem disputa pelo menos um pote junto com o
-    // hero — não faz sentido considerar "adversário" quem nem tá
-    // elegível pro mesmo dinheiro (side pot).
-    const rivals = contenders.filter((p) => p.id !== hero.id
-      && pots.some((pot) => pot.eligible.includes(hero.id) && pot.eligible.includes(p.id)));
-    if (rivals.length === 0) { result[hero.id] = { hasOuts: false, cards: [] }; return; }
+  const winSets = {};
+  contenders.forEach((p) => { winSets[p.id] = new Map(); }); // playerId -> Map("rank+suit" -> {rank,suit})
 
-    const winSet = new Map(); // "rank+suit" -> {rank,suit} — set, sem repetir carta
-    const winsOrTiesOn = (board) => {
-      const heroScore = bestHandFor(hero.cards, board, variant);
-      return rivals.every((r) => compareScores(heroScore, bestHandFor(r.cards, board, variant)) >= 0);
-    };
-
-    if (need === 1) {
-      // Só falta o river: um loop simples, uma carta por vez.
-      deck.forEach((c) => {
-        if (winsOrTiesOn([...community, c])) winSet.set(c.rank + c.suit, c);
+  // Avalia TODO mundo nesse board de uma vez, credita as cartas do
+  // board pra quem vencer/empatar cada pote que disputa nele.
+  const processBoard = (board, boardCards) => {
+    const scores = {};
+    contenders.forEach((p) => { scores[p.id] = bestHandFor(p.cards, board, variant); });
+    pots.forEach((pot) => {
+      let best = null;
+      let winners = [];
+      pot.eligible.forEach((id) => {
+        const s = scores[id];
+        if (!s) return;
+        const cmp = best ? compareScores(s, best) : 1;
+        if (cmp > 0) { best = s; winners = [id]; }
+        else if (cmp === 0) winners.push(id);
       });
-    } else {
-      // Faltam turn+river: o resultado final depende das DUAS juntas —
-      // por isso não dá pra olhar só "a próxima carta" isolada (pedido
-      // explícito). Enumera todo PAR de cartas restantes que completa
-      // o board; se esse par faz o hero vencer/empatar, as DUAS cartas
-      // entram no conjunto de outs (não importa qual seria "turn" e
-      // qual seria "river" — o board final é o mesmo dos dois jeitos).
-      for (let i = 0; i < deck.length; i++) {
-        for (let j = i + 1; j < deck.length; j++) {
-          if (winsOrTiesOn([...community, deck[i], deck[j]])) {
-            winSet.set(deck[i].rank + deck[i].suit, deck[i]);
-            winSet.set(deck[j].rank + deck[j].suit, deck[j]);
-          }
-        }
+      winners.forEach((id) => {
+        boardCards.forEach((c) => winSets[id].set(c.rank + c.suit, c));
+      });
+    });
+  };
+
+  if (need === 1) {
+    // Só falta o river: um loop simples, uma carta por vez.
+    deck.forEach((c) => processBoard([...community, c], [c]));
+  } else {
+    // Faltam turn+river: o resultado final depende das DUAS juntas —
+    // por isso não dá pra olhar só "a próxima carta" isolada (pedido
+    // explícito). Enumera todo PAR de cartas restantes que completa o
+    // board; não importa qual seria "turn" e qual "river" — o board
+    // final é o mesmo dos dois jeitos.
+    for (let i = 0; i < deck.length; i++) {
+      for (let j = i + 1; j < deck.length; j++) {
+        processBoard([...community, deck[i], deck[j]], [deck[i], deck[j]]);
       }
     }
-    result[hero.id] = { hasOuts: winSet.size > 0, cards: [...winSet.values()] };
+  }
+
+  contenders.forEach((p) => {
+    const set = winSets[p.id];
+    result[p.id] = { hasOuts: set.size > 0, cards: [...set.values()] };
   });
   return result;
 }
