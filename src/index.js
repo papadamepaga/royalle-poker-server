@@ -2858,6 +2858,36 @@ async function handleMessage(ws, msg, ctx) {
     return;
   }
 
+  // Diferente do find_table (que acha QUALQUER mesa aberta daquela
+  // variante/nível), esse aqui senta especificamente NESSA mesa — é o
+  // que o botão "+" de um assento vazio chama, depois que alguém
+  // levanta (continua assistindo) e quer (ou outra pessoa quer) sentar
+  // de volta ali mesmo, sem ser jogado pra outra mesa.
+  if (type === "sit_quick_table") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.isQuick || !rt.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    if (rt.table.players.some((p) => p.id === ws.username)) return ctx.reply({ ok: false, error: "Você já está sentado nessa mesa." });
+    const tier = STAKES_TIERS[rt.tierIndex];
+    if (!tier) return ctx.reply({ ok: false, error: "Configuração de mesa inválida." });
+    const seatCap = Math.min(MAX_SEATS, maxPlayersForVariant(rt.variant));
+    if (rt.table.players.length >= seatCap) return ctx.reply({ ok: false, error: "Mesa cheia." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    const minBuyIn = tier.buyIn;
+    const maxBuyIn = tier.buyIn * 4;
+    if (wallet.chips < minBuyIn) return ctx.reply({ ok: false, error: "Royalle Coins insuficientes pra esse nível." });
+    const buyIn = Math.min(maxBuyIn, Math.max(minBuyIn, Number(msg.buyIn) || minBuyIn), wallet.chips);
+    await adjustQuickWalletChips(ws.userId, -buyIn);
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
+    rt.sockets.add(ws);
+    rt.socketToPlayer.set(ws, ws.username);
+    ctx.setJoinedCode(code);
+    ctx.reply({ ok: true, code });
+    broadcastTable(code);
+    return;
+  }
+
   if (type === "claim_daily_bonus") {
     if (!requireAuth(ws, ctx)) return;
     const res = await claimDailyBonus(ws.userId);
