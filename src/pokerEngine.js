@@ -303,6 +303,78 @@ function computeWinProbs(contenders, community, variant) {
   return probs;
 }
 
+// Painel "Para vencer" (estilo GGPoker) — pra CADA jogador all-in,
+// calcula de verdade (reaproveitando bestHandFor/compareScores, o
+// MESMO avaliador de sempre, nada duplicado) quais cartas do baralho
+// restante fariam ELE vencer — não só melhorar a mão, VENCER de
+// verdade contra quem ainda disputa o(s) mesmo(s) pote(s) que ele
+// (side pot: só compara com quem tá elegível no mesmo pote, via
+// `pots`, igual o Run It já faz).
+//
+// Só calcula quando falta 1 carta (turn já saiu, só o river) ou 2
+// (flop já saiu, faltam turn+river) — pré-flop (faltam 5) fica fora de
+// escopo, seria C(~46,5) combinações, inviável calcular síncrono no
+// servidor. Também limitado a ≤3 envolvidos, mesma regra do Run It
+// Múltiplo (o próprio pedido amarra os dois).
+//
+// Simplificação assumida: uma carta que faz o jogador EMPATAR (não só
+// vencer sozinho) também entra no conjunto — o painel mostra "resultado
+// favorável", sem diferenciar visualmente vitória de chop nessa
+// primeira versão (dá pra refinar depois).
+//
+// Custo (medido): Hold'em/PLO4/5 fica bem rápido (<100ms). O pior caso
+// real é PLO6 com 3 jogadores all-in no FLOP (need=2, e cada
+// bestHandFor já é mais caro em Omaha) — testado isoladamente em
+// ~1,2s. É síncrono e bloqueia o processo Node inteiro durante esse
+// tempo (afetaria outras mesas rodando ao mesmo tempo). Não é ideal,
+// mas é raro (precisa mesa PLO6 cheia + 3 all-in exatos no flop) — se
+// virar problema de verdade, dá pra mover esse cálculo específico pra
+// um worker thread depois.
+export function computeWinningOuts(contenders, community, variant, deck, pots) {
+  const result = {};
+  const need = 5 - community.length;
+  if (need <= 0 || need > 2 || contenders.length < 2 || contenders.length > 3) return result;
+
+  contenders.forEach((hero) => {
+    // Só entra na conta quem disputa pelo menos um pote junto com o
+    // hero — não faz sentido considerar "adversário" quem nem tá
+    // elegível pro mesmo dinheiro (side pot).
+    const rivals = contenders.filter((p) => p.id !== hero.id
+      && pots.some((pot) => pot.eligible.includes(hero.id) && pot.eligible.includes(p.id)));
+    if (rivals.length === 0) { result[hero.id] = { hasOuts: false, cards: [] }; return; }
+
+    const winSet = new Map(); // "rank+suit" -> {rank,suit} — set, sem repetir carta
+    const winsOrTiesOn = (board) => {
+      const heroScore = bestHandFor(hero.cards, board, variant);
+      return rivals.every((r) => compareScores(heroScore, bestHandFor(r.cards, board, variant)) >= 0);
+    };
+
+    if (need === 1) {
+      // Só falta o river: um loop simples, uma carta por vez.
+      deck.forEach((c) => {
+        if (winsOrTiesOn([...community, c])) winSet.set(c.rank + c.suit, c);
+      });
+    } else {
+      // Faltam turn+river: o resultado final depende das DUAS juntas —
+      // por isso não dá pra olhar só "a próxima carta" isolada (pedido
+      // explícito). Enumera todo PAR de cartas restantes que completa
+      // o board; se esse par faz o hero vencer/empatar, as DUAS cartas
+      // entram no conjunto de outs (não importa qual seria "turn" e
+      // qual seria "river" — o board final é o mesmo dos dois jeitos).
+      for (let i = 0; i < deck.length; i++) {
+        for (let j = i + 1; j < deck.length; j++) {
+          if (winsOrTiesOn([...community, deck[i], deck[j]])) {
+            winSet.set(deck[i].rank + deck[i].suit, deck[i]);
+            winSet.set(deck[j].rank + deck[j].suit, deck[j]);
+          }
+        }
+      }
+    }
+    result[hero.id] = { hasOuts: winSet.size > 0, cards: [...winSet.values()] };
+  });
+  return result;
+}
+
 // Igual computeWinProbs, mas devolve a fração exata (não arredondada em
 // %) de cada contendor — usado só pelo "Dividir EV", onde arredondar
 // pra porcentagem inteira faria a soma dos pagamentos não bater com o
@@ -382,6 +454,10 @@ export class PokerTable {
     this.runItMismatch = false; // true por 1 broadcast: última rodada de voto não bateu
     this.runItPendingSince = null;
     this.winProbs = {}; // { playerId: percentInteiro } — só preenchido durante all-in runout / showdown
+    // "Para vencer" (estilo GGPoker) — { playerId: { hasOuts, cards } },
+    // só preenchido quando alguém fica all-in com carta ainda por vir e
+    // ≤3 envolvidos (ver computeWinningOuts).
+    this.winningOuts = {};
     this.winningHandCards = {}; // { playerId: [5 cartas] } — só preenchido em showdown de verdade (não quando todo mundo desiste)
     // Resultado em tempo real por jogador nessa mesa (buy-in total vs
     // saldo atual) — mantido pelo index.js (sit/rebuy/leave), a engine só
@@ -503,6 +579,7 @@ export class PokerTable {
     this.runItMismatch = false;
     this.runItPendingSince = null;
     this.winProbs = {};
+    this.winningOuts = {};
     this.winningHandCards = {};
 
     let firstActorSeatForQueue = bbIdx;
@@ -631,7 +708,41 @@ export class PokerTable {
     }
   }
 
+  // Devolve a parte de uma aposta/all-in que NINGUÉM mais tinha ficha
+  // pra cobrir — regra padrão do poker ("return uncalled bet"). Sem
+  // isso, esse excedente virava uma camada de pote só com o próprio
+  // apostador como elegível (ninguém disputando de verdade), mostrado
+  // errado como "side pot" no meio da mesa, e ainda saía taxado de rake
+  // como se fosse pote de verdade quando na prática nunca esteve em
+  // risco. Compara contra o SEGUNDO maior totalBet entre TODOS que
+  // colocaram ficha (mesmo quem já desistiu — a ficha de quem foldou
+  // continua valendo pra "cobrir" a camada, só não concorre mais por
+  // ela), então funciona certo em heads-up e em mesa cheia com side pot
+  // de verdade (só devolve a sobra do topo, nunca mexe nas camadas
+  // abaixo onde tem gente de verdade disputando).
+  returnUncalledBet() {
+    const contributors = this.players.filter((p) => p.totalBet > 0);
+    if (contributors.length < 2) return;
+    const sorted = [...contributors].sort((a, b) => b.totalBet - a.totalBet);
+    const top = sorted[0];
+    if (top.folded) return; // não deveria acontecer (quem foldou não é o último a apostar), mas por segurança
+    const secondAmt = sorted[1].totalBet;
+    if (top.totalBet <= secondAmt) return;
+    const excess = top.totalBet - secondAmt;
+    top.totalBet -= excess;
+    top.roundBet = Math.max(0, top.roundBet - excess);
+    top.chips += excess;
+    if (top.allIn && top.chips > 0) top.allIn = false; // não tava mais all-in de verdade por esse tanto
+    this.pot = this.players.reduce((s, p) => s + p.totalBet, 0);
+    this.addLog(`${top.name} recebe de volta ${excess} — ninguém tinha ficha pra cobrir essa parte da aposta.`);
+  }
+
   advanceStage() {
+    // Sempre a primeira coisa a checar quando uma rodada de apostas
+    // fecha (é chamado exatamente nesse momento, nunca no meio de uma
+    // rodada ainda em aberto) — antes de revelar qualquer carta ou
+    // formar qualquer pote pra exibição.
+    this.returnUncalledBet();
     this.players.forEach((p) => { p.roundBet = 0; });
     const contenders = activeInHand(this.players);
     const stillNeedAction = needMoreAction(this.players);
@@ -651,6 +762,7 @@ export class PokerTable {
       if (contenders.length > 1 && !stillNeedAction && this.runItCount === null) {
         this.allInRunout = true;
         this.winProbs = computeWinProbs(contenders, this.community, this.variant);
+        this.winningOuts = computeWinningOuts(contenders, this.community, this.variant, this.deck, this.pot > 0 ? computePots(this.players) : []);
         const options = contenders.length <= 3 ? this.runItAvailableOptions() : [1];
         if (options.length > 1) {
           this.runItPending = true;
@@ -688,6 +800,7 @@ export class PokerTable {
           // transmissões de poker — reduz conforme menos cartas ficam
           // desconhecidas.
           this.winProbs = computeWinProbs(contenders, this.community, this.variant);
+          this.winningOuts = computeWinningOuts(contenders, this.community, this.variant, this.deck, this.pot > 0 ? computePots(this.players) : []);
         }
         if (this.stage === "river") {
           // No more betting possible (everyone left is all-in) and we
@@ -785,6 +898,7 @@ export class PokerTable {
       this.winProbs = {};
       contenders.forEach((p) => { this.winProbs[p.id] = tags[p.id] ? 100 : 0; });
     }
+    this.winningOuts = {}; // mão decidida — não tem mais "carta pra vencer" a mostrar
     this.results = tags;
     this.stage = "showdown";
     this.actingId = null;
@@ -950,6 +1064,7 @@ export class PokerTable {
     });
 
     this.winProbs = {};
+    this.winningOuts = {}; // já rodou tudo (Run It resolvido) — não tem mais out a mostrar
     contenders.forEach((p) => { this.winProbs[p.id] = tags[p.id] ? 100 : 0; });
     this.results = tags;
     this.stage = "showdown";
@@ -1115,6 +1230,11 @@ export class PokerTable {
       runItBoardResults: this.runItBoardResults || null,
       runItMismatch: !!this.runItMismatch,
       winProbs: this.winProbs || {},
+      // "Para vencer" (GGPoker-style) — cartas de verdade que fariam
+      // CADA jogador all-in vencer, calculadas pelo mesmo avaliador de
+      // mãos de sempre (bestHandFor/compareScores). Vazio quando não
+      // aplica (river já aberto, 4+ envolvidos, ninguém all-in ainda).
+      winningOuts: this.winningOuts || {},
       results: this.results,
       // Cartas exatas de quem ganhou algum pote nessa mão (5 cartas cada)
       // — a UI usa isso pra acender um brilho só nelas, no board e na mão
