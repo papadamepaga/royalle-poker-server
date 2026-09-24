@@ -706,17 +706,23 @@ export async function removeJoinRequest(clubId, userId) {
 }
 
 export async function createUser(username, passwordHash, avatar) {
+  // Promove a super_admin JÁ no cadastro, se o username bater com
+  // SUPER_ADMIN_USERNAME — funciona tanto com Postgres quanto no modo
+  // em memória (nesse modo o servidor não guarda usuário entre
+  // reinícios, então checar só uma vez no início não adiantaria nada;
+  // aqui pega na hora, sempre que a conta é criada de verdade).
+  const platformRole = (process.env.SUPER_ADMIN_USERNAME && username === process.env.SUPER_ADMIN_USERNAME) ? "super_admin" : null;
   if (hasDatabase) {
     const { rows } = await pool.query(
-      "INSERT INTO users (username, password_hash, avatar) VALUES ($1,$2,$3) RETURNING id, username, avatar",
-      [username, passwordHash, avatar]
+      "INSERT INTO users (username, password_hash, avatar, platform_role) VALUES ($1,$2,$3,$4) RETURNING id, username, avatar, platform_role",
+      [username, passwordHash, avatar, platformRole]
     );
     return rows[0];
   }
   if (mem.users.find((u) => u.username.toLowerCase() === username.toLowerCase())) return null;
-  const user = { id: mem.nextUserId++, username, password_hash: passwordHash, avatar };
+  const user = { id: mem.nextUserId++, username, password_hash: passwordHash, avatar, platform_role: platformRole };
   mem.users.push(user);
-  return { id: user.id, username: user.username, avatar: user.avatar };
+  return { id: user.id, username: user.username, avatar: user.avatar, platform_role: user.platform_role };
 }
 
 export async function findUserByUsername(username) {
