@@ -29,6 +29,12 @@ import {
   setMemberNickname, setMemberNote, touchLastSeen, getMemberCareerEntries,
   createTournament, listClubTournaments, listActiveTournaments, getTournamentById, updateTournament,
   listTournamentEntries, getTournamentEntry, addTournamentEntry, removeTournamentEntry, updateTournamentEntry,
+  getUserPlatformRole, listAllClubsForMaster, getClubForMasterDetail, setClubStatus,
+  listAllUsersForMaster, getUserForMasterDetail, setUserStatus,
+  listDiamondPackages, createDiamondPackage, updateDiamondPackage, creditDiamondsWithLedger, listDiamondTransactions,
+  getActiveCommercialCondition, listCommercialConditionHistory, setClubCommercialCondition,
+  listClubLevelConfigs, setClubLevelConfig,
+  recordAdminAuditLog, listAdminAuditLogs, getPlatformFinancialSummary,
 } from "./store.js";
 import { MAX_SEATS, makeBotId, pickBotName, pickBotAction } from "./bots.js";
 
@@ -181,7 +187,12 @@ const BLIND_STRUCTURES = {
 // Níveis de clube (Clube Nível, igual PPPoker) — cada um vale 30 dias e
 // dá mais capacidade de membros/gestores. Nível 0 é o padrão gratuito
 // (sem compra), com uma capacidade bem enxuta.
-const CLUB_LEVEL_TIERS = {
+// Valor inicial = mesmo de sempre (fallback caso o banco ainda não
+// tenha semeado club_level_configs) — mas isso agora é só o ponto de
+// partida: reloadClubLevelTiers() troca pelo que estiver configurado
+// no Royalle Master, sem precisar reiniciar o servidor pra pegar uma
+// mudança de preço/limite de nível.
+let CLUB_LEVEL_TIERS = {
   0: { gestor: 1, membro: 10, price: 0 },
   1: { gestor: 3, membro: 60, price: 1500 },
   2: { gestor: 4, membro: 100, price: 2500 },
@@ -194,6 +205,13 @@ const CLUB_LEVEL_TIERS = {
   9: { gestor: 25, membro: 1800, price: 80000 },
   10: { gestor: 50, membro: 2500, price: 110000 },
 };
+async function reloadClubLevelTiers() {
+  const rows = await listClubLevelConfigs();
+  if (!rows.length) return;
+  const next = {};
+  rows.forEach((r) => { next[r.level] = { gestor: r.gestor_cap, membro: r.membro_cap, price: Number(r.price_diamonds) }; });
+  CLUB_LEVEL_TIERS = next;
+}
 // Nível "de verdade" agora — se a validade (30 dias) já passou, volta
 // pro nível 0 na prática, mesmo que o banco ainda tenha o número antigo
 // guardado (evita precisar de um relógio de fundo só pra isso).
@@ -1235,8 +1253,267 @@ function requireAuth(ws, ctx) {
   return true;
 }
 
+// Royalle Master — só quem tem platform_role='super_admin' passa daqui.
+// Sempre confere no SERVIDOR (nunca confia em nada que o cliente diga
+// sobre si mesmo) — é o mesmo princípio do requireAuth, só que checando
+// permissão de PLATAFORMA em vez de só "tá logado".
+async function requireSuperAdmin(ws, ctx) {
+  if (!requireAuth(ws, ctx)) return false;
+  const role = await getUserPlatformRole(ws.userId);
+  if (role !== "super_admin") { ctx.reply({ ok: false, error: "Sem permissão de administrador da plataforma." }); return false; }
+  return true;
+}
+
 async function handleMessage(ws, msg, ctx) {
   const { type } = msg;
+
+  // ============================================================
+  // ROYALLE MASTER — painel administrativo da PLATAFORMA. Só quem tem
+  // platform_role='super_admin' (checado no servidor, sempre) passa
+  // daqui. Nada aqui mexe na lógica de poker/mesas — é tudo consulta e
+  // administração (clube, usuário, diamante, condição comercial, nível,
+  // log). Toda ação que MUDA algo grava em admin_audit_logs.
+  // ============================================================
+  if (type === "master_get_dashboard") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const from = msg.from || new Date(Date.now() - 30 * 86400000).toISOString();
+    const to = msg.to || new Date().toISOString();
+    const [clubs, users, financial, diamondTxs] = await Promise.all([
+      listAllClubsForMaster(), listAllUsersForMaster(), getPlatformFinancialSummary(from, to), listDiamondTransactions({ limit: 500 }),
+    ]);
+    const now = Date.now();
+    const todayStart = new Date(new Date().toDateString()).getTime();
+    const clubsActive = clubs.filter((c) => c.status === "active" || !c.status).length;
+    const clubsBlocked = clubs.filter((c) => c.status === "blocked" || c.status === "suspended").length;
+    const clubsExpiring7d = clubs.filter((c) => c.level_expires_at && new Date(c.level_expires_at).getTime() - now < 7 * 86400000 && new Date(c.level_expires_at).getTime() > now).length;
+    const clubsExpiring3d = clubs.filter((c) => c.level_expires_at && new Date(c.level_expires_at).getTime() - now < 3 * 86400000 && new Date(c.level_expires_at).getTime() > now).length;
+    const clubsExpired = clubs.filter((c) => c.level_expires_at && new Date(c.level_expires_at).getTime() <= now).length;
+    const usersActiveToday = users.filter((u) => u.last_seen && new Date(u.last_seen).getTime() >= todayStart).length;
+    const owners = clubs.length; // 1 dono por clube
+    const agentsTotal = clubs.reduce((s, c) => s + Number(c.agent_count || 0), 0);
+    const diamondsSoldToday = diamondTxs.filter((t) => t.type === "manual_sale" && new Date(t.created_at).getTime() >= todayStart).reduce((s, t) => s + t.diamonds_delta, 0);
+    const activeTablesNow = Array.from(runtime.values()).filter((rt) => rt.table).length;
+    ctx.reply({
+      ok: true,
+      clubs: { total: clubs.length, active: clubsActive, blocked: clubsBlocked, expiring7d: clubsExpiring7d, expiring3d: clubsExpiring3d, expired: clubsExpired },
+      users: { total: users.length, activeToday: usersActiveToday, owners, agents: agentsTotal },
+      diamonds: { soldToday: diamondsSoldToday, soldPeriod: financial.diamondsSold, revenueBrlPeriod: financial.diamondRevenueBrl, transactionCountPeriod: financial.diamondTransactionCount },
+      financial,
+      operation: { activeTablesNow },
+    });
+    return;
+  }
+
+  if (type === "master_list_clubs") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const clubs = await listAllClubsForMaster();
+    ctx.reply({ ok: true, clubs });
+    return;
+  }
+
+  if (type === "master_get_club_detail") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const club = await getClubForMasterDetail(Number(msg.clubId));
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const [members, condition, conditionHistory, levelTier] = await Promise.all([
+      listMembers(club.id), getActiveCommercialCondition(club.id), listCommercialConditionHistory(club.id),
+      Promise.resolve(effectiveClubLevel(club)),
+    ]);
+    ctx.reply({ ok: true, club, members, condition, conditionHistory, levelTier });
+    return;
+  }
+
+  if (type === "master_set_club_status") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    if (!["active", "blocked", "suspended"].includes(msg.status)) return ctx.reply({ ok: false, error: "Status inválido." });
+    const club = await getClubForMasterDetail(Number(msg.clubId));
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const before = club.status || "active";
+    await setClubStatus(club.id, msg.status);
+    await recordAdminAuditLog({ adminId: ws.userId, action: "set_club_status", targetType: "club", targetId: club.id, before: { status: before }, after: { status: msg.status }, reason: msg.reason || null });
+    ctx.reply({ ok: true, status: msg.status });
+    return;
+  }
+
+  if (type === "master_list_users") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const users = await listAllUsersForMaster();
+    ctx.reply({ ok: true, users });
+    return;
+  }
+
+  if (type === "master_get_user_detail") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const user = await getUserForMasterDetail(Number(msg.userId));
+    if (!user) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
+    const diamondHistory = await listDiamondTransactions({ userId: user.id, limit: 100 });
+    ctx.reply({ ok: true, user, diamondHistory });
+    return;
+  }
+
+  if (type === "master_set_user_status") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    if (!["active", "blocked", "suspended"].includes(msg.status)) return ctx.reply({ ok: false, error: "Status inválido." });
+    const user = await getUserForMasterDetail(Number(msg.userId));
+    if (!user) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
+    const before = user.status || "active";
+    await setUserStatus(user.id, msg.status);
+    await recordAdminAuditLog({ adminId: ws.userId, action: "set_user_status", targetType: "user", targetId: user.id, before: { status: before }, after: { status: msg.status }, reason: msg.reason || null });
+    ctx.reply({ ok: true, status: msg.status });
+    return;
+  }
+
+  if (type === "master_list_diamond_packages") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const packages = await listDiamondPackages(false);
+    ctx.reply({ ok: true, packages });
+    return;
+  }
+
+  if (type === "master_create_diamond_package") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const diamonds = Math.max(1, Number(msg.diamonds) || 0);
+    const coinCost = Math.max(1, Number(msg.coinCost) || 0);
+    const bonusDiamonds = Math.max(0, Number(msg.bonusDiamonds) || 0);
+    const pkg = await createDiamondPackage({ diamonds, coinCost, bonusDiamonds, sortOrder: Number(msg.sortOrder) || 0 });
+    await recordAdminAuditLog({ adminId: ws.userId, action: "create_diamond_package", targetType: "diamond_package", targetId: pkg.id, after: pkg });
+    ctx.reply({ ok: true, package: pkg });
+    return;
+  }
+
+  if (type === "master_update_diamond_package") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const before = (await listDiamondPackages(false)).find((p) => p.id === Number(msg.packageId));
+    if (!before) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
+    const fields = {};
+    if (msg.diamonds != null) fields.diamonds = Math.max(1, Number(msg.diamonds));
+    if (msg.coinCost != null) fields.coinCost = Math.max(1, Number(msg.coinCost));
+    if (msg.bonusDiamonds != null) fields.bonusDiamonds = Math.max(0, Number(msg.bonusDiamonds));
+    if (msg.active != null) fields.active = !!msg.active;
+    if (msg.sortOrder != null) fields.sortOrder = Number(msg.sortOrder);
+    const pkg = await updateDiamondPackage(msg.packageId, fields);
+    await recordAdminAuditLog({ adminId: ws.userId, action: "update_diamond_package", targetType: "diamond_package", targetId: pkg.id, before, after: pkg });
+    ctx.reply({ ok: true, package: pkg });
+    return;
+  }
+
+  // Venda manual de diamante — pra vendas fechadas por fora (WhatsApp,
+  // PIX etc.), dinheiro real que o dono/admin recebeu FORA do app. O
+  // app não processa pagamento nenhum; isso aqui só registra o que já
+  // aconteceu e credita o diamante, com ledger completo (nunca só soma
+  // saldo — ver creditDiamondsWithLedger).
+  if (type === "master_manual_diamond_sale") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const target = await findUserByUsername(msg.targetUsername || "");
+    if (!target) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
+    const diamonds = Math.round(Number(msg.diamonds));
+    if (!(diamonds > 0)) return ctx.reply({ ok: false, error: "Quantidade de diamantes inválida." });
+    const amountBrl = msg.amountBrl != null ? Number(msg.amountBrl) : null;
+    const { transaction, balanceAfter } = await creditDiamondsWithLedger(target.id, diamonds, {
+      type: "manual_sale", amountBrl, paymentMethod: msg.paymentMethod || null, channel: msg.channel || "whatsapp",
+      note: msg.note || null, adminId: ws.userId,
+    });
+    await recordAdminAuditLog({ adminId: ws.userId, action: "manual_diamond_sale", targetType: "user", targetId: target.id, after: transaction, reason: msg.note || null });
+    ctx.reply({ ok: true, transaction, balanceAfter });
+    return;
+  }
+
+  if (type === "master_adjust_diamonds") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const target = await findUserByUsername(msg.targetUsername || "");
+    if (!target) return ctx.reply({ ok: false, error: "Usuário não encontrado." });
+    const delta = Math.round(Number(msg.delta));
+    if (!delta) return ctx.reply({ ok: false, error: "Ajuste inválido." });
+    const { transaction, balanceAfter } = await creditDiamondsWithLedger(target.id, delta, {
+      type: "admin_adjust", note: msg.reason || null, adminId: ws.userId,
+    });
+    await recordAdminAuditLog({ adminId: ws.userId, action: "adjust_diamonds", targetType: "user", targetId: target.id, after: transaction, reason: msg.reason || null });
+    ctx.reply({ ok: true, transaction, balanceAfter });
+    return;
+  }
+
+  if (type === "master_list_diamond_transactions") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const transactions = await listDiamondTransactions({ userId: msg.userId ? Number(msg.userId) : null, limit: Math.min(500, Number(msg.limit) || 200) });
+    ctx.reply({ ok: true, transactions });
+    return;
+  }
+
+  if (type === "master_list_commercial_condition_history") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const history = await listCommercialConditionHistory(Number(msg.clubId));
+    ctx.reply({ ok: true, history });
+    return;
+  }
+
+  if (type === "master_set_commercial_condition") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const club = await getClubForMasterDetail(Number(msg.clubId));
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const before = await getActiveCommercialCondition(club.id);
+    const condition = await setClubCommercialCondition(club.id, {
+      model: msg.model || "standard",
+      platformRakePercent: Number(msg.platformRakePercent) || 0,
+      clubRakePercent: Number(msg.clubRakePercent) || 0,
+      renewalPriceBrl: msg.renewalPriceBrl != null ? Number(msg.renewalPriceBrl) : null,
+      renewalPeriodicityDays: msg.renewalPeriodicityDays != null ? Number(msg.renewalPeriodicityDays) : null,
+      transferFeePercent: msg.transferFeePercent != null ? Number(msg.transferFeePercent) : 5,
+      diamondDiscountPercent: Number(msg.diamondDiscountPercent) || 0,
+      memberLimit: msg.memberLimit != null ? Number(msg.memberLimit) : null,
+      tableLimit: msg.tableLimit != null ? Number(msg.tableLimit) : null,
+      benefits: msg.benefits || null,
+      endsAt: msg.endsAt || null,
+    }, ws.userId, msg.reason || null);
+    await recordAdminAuditLog({ adminId: ws.userId, action: "set_commercial_condition", targetType: "club", targetId: club.id, before, after: condition, reason: msg.reason || null });
+    ctx.reply({ ok: true, condition });
+    return;
+  }
+
+  if (type === "master_list_club_level_configs") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const levels = await listClubLevelConfigs();
+    ctx.reply({ ok: true, levels });
+    return;
+  }
+
+  if (type === "master_set_club_level_config") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const level = Number(msg.level);
+    if (!(level >= 0)) return ctx.reply({ ok: false, error: "Nível inválido." });
+    const before = (await listClubLevelConfigs()).find((l) => l.level === level) || null;
+    const updated = await setClubLevelConfig(level, {
+      gestorCap: Math.max(0, Number(msg.gestorCap) || 0),
+      membroCap: Math.max(0, Number(msg.membroCap) || 0),
+      priceDiamonds: Math.max(0, Number(msg.priceDiamonds) || 0),
+      benefits: msg.benefits || null,
+    }, ws.userId);
+    await reloadClubLevelTiers(); // pega a mudança na hora, sem reiniciar o servidor
+    await recordAdminAuditLog({ adminId: ws.userId, action: "set_club_level_config", targetType: "club_level", targetId: level, before, after: updated });
+    ctx.reply({ ok: true, level: updated });
+    return;
+  }
+
+  if (type === "master_list_audit_logs") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const logs = await listAdminAuditLogs({ limit: Math.min(500, Number(msg.limit) || 200) });
+    ctx.reply({ ok: true, logs });
+    return;
+  }
+
+  if (type === "master_get_financial_summary") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const from = msg.from || new Date(Date.now() - 7 * 86400000).toISOString();
+    const to = msg.to || new Date().toISOString();
+    const [summary, clubs] = await Promise.all([getPlatformFinancialSummary(from, to), listAllClubsForMaster()]);
+    // Fechamento por clube dentro do período — reaproveita rake_events
+    // igual o fechamento normal de clube já faz, só que somando todos.
+    const perClub = await Promise.all(clubs.map(async (c) => {
+      const s = await getRakeSummary(c.id, from, to);
+      return { clubId: c.id, clubName: c.name, ...s };
+    }));
+    ctx.reply({ ok: true, summary, perClub: perClub.filter((c) => c.grossRake > 0 || c.gross > 0) });
+    return;
+  }
 
   if (type === "signup") {
     const username = (msg.username || "").trim();
@@ -1253,7 +1530,7 @@ async function handleMessage(ws, msg, ctx) {
     onlineByUsername.set(ws.username, ws);
     await touchLastSeen(user.id);
     const token = signToken(user.id, user.username);
-    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: null, nickname: user.nickname || null } });
+    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: null, nickname: user.nickname || null, platformRole: user.platform_role || null } });
     return;
   }
 
@@ -1267,7 +1544,7 @@ async function handleMessage(ws, msg, ctx) {
     onlineByUsername.set(ws.username, ws);
     await touchLastSeen(user.id);
     const token = signToken(user.id, user.username);
-    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
+    ctx.reply({ ok: true, token, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null, platformRole: user.platform_role || null } });
     return;
   }
 
@@ -1279,7 +1556,7 @@ async function handleMessage(ws, msg, ctx) {
     ws.userId = user.id; ws.username = user.username;
     onlineByUsername.set(ws.username, ws);
     await touchLastSeen(user.id);
-    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
+    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null, platformRole: user.platform_role || null } });
     return;
   }
 
@@ -1611,7 +1888,7 @@ async function handleMessage(ws, msg, ctx) {
     const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
     const me = await getMember(club.id, ws.userId);
-    if (!me || me.role !== "owner") return ctx.reply({ ok: false, error: "Só o dono do clube vê a Gestão de Rake." });
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão pra ver a Gestão de Rake." });
     const from = msg.from || new Date(0).toISOString();
     const to = msg.to || new Date().toISOString();
     const summary = await getRakeSummary(club.id, from, to);
@@ -1655,7 +1932,7 @@ async function handleMessage(ws, msg, ctx) {
     const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
     const me = await getMember(club.id, ws.userId);
-    if (!me || me.role !== "owner") return ctx.reply({ ok: false, error: "Só o dono do clube pode fechar o período." });
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão pra fechar o período." });
     if (!msg.from || !msg.to) return ctx.reply({ ok: false, error: "Período inválido." });
     const { closing, eventCount } = await closeRakePeriod(club.id, msg.periodType || "custom", msg.from, msg.to, ws.userId);
     ctx.reply({ ok: true, closing, eventCount });
@@ -1667,7 +1944,7 @@ async function handleMessage(ws, msg, ctx) {
     const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
     const me = await getMember(club.id, ws.userId);
-    if (!me || me.role !== "owner") return ctx.reply({ ok: false, error: "Só o dono do clube vê fechamentos." });
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão pra ver fechamentos." });
     const closings = await listRakeClosings(club.id);
     ctx.reply({ ok: true, closings });
     return;
@@ -1678,7 +1955,7 @@ async function handleMessage(ws, msg, ctx) {
     const club = await getClubByCode((msg.code || "").toUpperCase());
     if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
     const me = await getMember(club.id, ws.userId);
-    if (!me || me.role !== "owner") return ctx.reply({ ok: false, error: "Só o dono do clube vê detalhe de fechamento." });
+    if (!me || (me.role !== "owner" && me.role !== "agent")) return ctx.reply({ ok: false, error: "Sem permissão pra ver detalhe de fechamento." });
     const { closing, events } = await getRakeClosingDetail(msg.closingId);
     if (!closing || closing.club_id !== club.id) return ctx.reply({ ok: false, error: "Fechamento não encontrado." });
     ctx.reply({ ok: true, closing, events });
@@ -1741,12 +2018,46 @@ async function handleMessage(ws, msg, ctx) {
     if (delta < 0 && balanceBefore < -delta) {
       return ctx.reply({ ok: false, error: "Esse jogador não tem fichas suficientes pra essa retirada." });
     }
-    // Taxa do app de 5% — só no ENVIO (dono/agente pra jogador), nunca
-    // na retirada. Cobra da TESOURARIA do clube, não do jogador — quem
-    // manda 2.000 quer que o jogador receba os 2.000 inteiros; é o
-    // clube que paga 100 a mais de taxa em cima disso (total 2.100 saindo
-    // da tesouraria).
+    // Taxa do app de 5% — só no ENVIO (dono/gestor pra jogador), nunca
+    // na retirada. Quem manda 2.000 quer que o jogador receba os 2.000
+    // inteiros — quem PAGA a taxa é quem está mandando (100 a mais).
     const sendFee = delta > 0 ? Math.floor(delta * 0.05) : 0;
+    // Gestor (role=agent, diferente do Agente de rake) nunca mexe na
+    // tesouraria do clube — só o dono vê e controla o total de verdade.
+    // O saldo que o Gestor movimenta é o PRÓPRIO (member.chips dele
+    // mesmo) — o dono abastece esse saldo mandando fichas pra ele do
+    // jeito normal (esse mesmo adjust_chips, como dono), e o Gestor
+    // repassa de lá pros membros. Retirada que o Gestor faz de um
+    // membro volta pro saldo PRÓPRIO dele (não pra tesouraria), já que
+    // não foi de lá que saiu.
+    const senderIsAgentRole = me.role === "agent";
+    if (senderIsAgentRole) {
+      const senderBefore = await getMember(club.id, ws.userId);
+      const senderBalance = senderBefore ? Number(senderBefore.chips) : 0;
+      if (delta > 0 && senderBalance < delta + sendFee) {
+        return ctx.reply({ ok: false, error: "Seu saldo não cobre esse envio + a taxa de 5%." });
+      }
+      const chips = await adjustMemberChips(club.id, target.id, delta);
+      // delta>0: sai do PRÓPRIO saldo (delta+taxa); delta<0 (retirada):
+      // volta pro PRÓPRIO saldo (sem taxa).
+      const senderChips = await adjustMemberChips(club.id, ws.userId, delta > 0 ? -(delta + sendFee) : -delta);
+      if (sendFee > 0) await recordRake(club.id, 0, sendFee);
+      await recordPayLedger({
+        clubId: club.id, userId: target.id, adminId: ws.userId,
+        type: delta >= 0 ? "send" : "withdraw",
+        amount: Math.abs(delta), balanceBefore, balanceAfter: Number(chips),
+      });
+      ctx.reply({ ok: true, chips, fee: sendFee, senderChips: senderChips !== null ? Number(senderChips) : undefined });
+      await broadcastClub(club.code);
+      if (delta > 0) {
+        await createNotification(target.id, club.id, "Fichas Recebidas!",
+          `"${ws.username}" (ID: ${ws.userId}) enviou ${Math.abs(delta).toLocaleString("pt-BR")} fichas para você.`);
+      } else if (delta < 0) {
+        await createNotification(target.id, club.id, "Fichas Retiradas",
+          `"${ws.username}" (ID: ${ws.userId}) retirou ${Math.abs(delta).toLocaleString("pt-BR")} fichas de você.`);
+      }
+      return;
+    }
     if (delta > 0 && Number(club.treasury_chips) < delta + sendFee) {
       return ctx.reply({ ok: false, error: "Saldo do clube insuficiente pra cobrir o envio + a taxa de 5%." });
     }
@@ -2750,7 +3061,7 @@ async function handleMessage(ws, msg, ctx) {
     const res = await setNickname(ws.userId, trimmed);
     if (!res.ok) return ctx.reply({ ok: false, error: res.error });
     const user = await findUserById(ws.userId);
-    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null } });
+    ctx.reply({ ok: true, user: { id: user.id, username: user.username, avatar: user.avatar, avatarImage: user.avatar_image || null, nickname: user.nickname || null, platformRole: user.platform_role || null } });
     const myClubs = await listClubsForUser(ws.userId);
     for (const c of myClubs) await broadcastClub(c.code);
     return;
@@ -3231,6 +3542,7 @@ wss.on("connection", (ws, req) => {
 });
 
 migrate()
+  .then(() => reloadClubLevelTiers())
   .then(() => {
     httpServer.listen(PORT, () => {
       console.log(`Royalle Poker server rodando na porta ${PORT}`);

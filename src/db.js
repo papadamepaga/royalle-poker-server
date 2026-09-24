@@ -483,5 +483,147 @@ export async function migrate() {
     );
   `);
 
+  // ============================================================
+  // ROYALLE MASTER — painel administrativo da PLATAFORMA (diferente do
+  // "Admin" que o dono de um clube já tem, que só enxerga o próprio
+  // clube). Tudo aqui é aditivo — nenhuma tabela existente perde coluna
+  // nem dado.
+  // ============================================================
+
+  // platform_role: null = usuário normal; 'super_admin' = acesso total
+  // ao Royalle Master. status: pra bloquear/suspender uma CONTA (não
+  // confundir com o role dentro de um clube, que é outra coisa).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS platform_role TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';`);
+  // Mesma ideia pro clube — 'active' | 'blocked' | 'suspended'.
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';`);
+
+  // Pacotes de diamante configuráveis pelo Master (hoje eram fixos no
+  // código do app) — preço em Royalle Coin, igual sempre foi (ver
+  // decisão registrada no chat: diamante nesse app não é dinheiro real,
+  // "venda manual" é o dono registrando uma venda que ele fechou por
+  // fora, em R$, e creditando o diamante correspondente aqui).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS diamond_packages (
+      id SERIAL PRIMARY KEY,
+      diamonds INTEGER NOT NULL,
+      coin_cost BIGINT NOT NULL,
+      bonus_diamonds INTEGER NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT true,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Ledger de diamante — igual ao padrão que o app já usa pra fichas
+  // (pay_ledger) e rake (rake_events): nunca só soma saldo, sempre
+  // guarda o antes/depois. amount_brl é OPCIONAL e só preenchido numa
+  // venda manual (dinheiro real que o dono recebeu por fora, tipo PIX);
+  // nas outras origens (bônus, ajuste, uso dentro do app) fica nulo.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS diamond_transactions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      type TEXT NOT NULL, -- 'manual_sale' | 'bonus' | 'admin_adjust' | 'usage' | 'app_purchase'
+      diamonds_delta INTEGER NOT NULL,
+      balance_before BIGINT NOT NULL,
+      balance_after BIGINT NOT NULL,
+      amount_brl NUMERIC, -- só em venda manual: quanto dinheiro real foi recebido
+      payment_method TEXT, -- 'pix' | 'dinheiro' | outro, só em venda manual
+      channel TEXT, -- 'whatsapp' | 'app' | outro
+      note TEXT,
+      admin_id INTEGER REFERENCES users(id), -- quem executou (null se foi o próprio sistema)
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Condição comercial por clube — histórico completo (nunca
+  // sobrescreve, sempre cria uma linha nova e marca a anterior como
+  // inativa), com vigência opcional (ends_at) pra voltar sozinho ao
+  // padrão. A condição ATIVA de um clube é a de maior id com active=true
+  // e (ends_at IS NULL OR ends_at > now()).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_commercial_conditions (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      model TEXT NOT NULL DEFAULT 'standard', -- standard | partner | vip | enterprise | custom
+      platform_rake_percent NUMERIC NOT NULL DEFAULT 20,
+      club_rake_percent NUMERIC NOT NULL DEFAULT 80,
+      renewal_price_brl NUMERIC,
+      renewal_periodicity_days INTEGER,
+      transfer_fee_percent NUMERIC NOT NULL DEFAULT 5,
+      diamond_discount_percent NUMERIC NOT NULL DEFAULT 0,
+      member_limit INTEGER,
+      table_limit INTEGER,
+      benefits TEXT,
+      starts_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ends_at TIMESTAMPTZ,
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_by INTEGER REFERENCES users(id),
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Nível de clube configurável pelo Master — substitui a tabela fixa
+  // que existia no código (CLUB_LEVEL_TIERS). Semeado com os MESMOS
+  // valores que já estavam no código, pra não mudar nada pra quem já
+  // tem clube em algum nível.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_level_configs (
+      level INTEGER PRIMARY KEY,
+      gestor_cap INTEGER NOT NULL,
+      membro_cap INTEGER NOT NULL,
+      price_diamonds BIGINT NOT NULL,
+      benefits TEXT,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  {
+    const seed = [
+      [0, 1, 10, 0], [1, 3, 60, 1500], [2, 4, 100, 2500], [3, 5, 150, 4000], [4, 6, 250, 8000],
+      [5, 10, 600, 20000], [6, 12, 800, 30000], [7, 15, 1200, 45000], [8, 20, 1500, 60000],
+      [9, 25, 1800, 80000], [10, 50, 2500, 110000],
+    ];
+    for (const [level, gestor, membro, price] of seed) {
+      await pool.query(
+        `INSERT INTO club_level_configs (level, gestor_cap, membro_cap, price_diamonds)
+         VALUES ($1,$2,$3,$4) ON CONFLICT (level) DO NOTHING`,
+        [level, gestor, membro, price]
+      );
+    }
+  }
+
+  // Log de auditoria — toda ação administrativa importante do Master
+  // gera uma linha aqui. before/after em JSON pra guardar "o que era" e
+  // "o que virou" sem precisar de uma tabela por tipo de ação.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id SERIAL PRIMARY KEY,
+      admin_id INTEGER REFERENCES users(id),
+      action TEXT NOT NULL,
+      target_type TEXT, -- 'club' | 'user' | 'diamond_package' | 'club_level' | 'commercial_condition' | ...
+      target_id TEXT,
+      before_json JSONB,
+      after_json JSONB,
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Bootstrap: se a variável de ambiente SUPER_ADMIN_USERNAME estiver
+  // definida e esse usuário já existir (se cadastrou normal no app),
+  // promove ele a super_admin automaticamente a cada start do servidor
+  // — sem isso não existiria NENHUM jeito de entrar no Master pela
+  // primeira vez (ninguém pode se autopromover pelo próprio app).
+  if (process.env.SUPER_ADMIN_USERNAME) {
+    await pool.query(
+      `UPDATE users SET platform_role = 'super_admin' WHERE username = $1 AND platform_role IS DISTINCT FROM 'super_admin'`,
+      [process.env.SUPER_ADMIN_USERNAME]
+    );
+  }
+
   console.log("Banco de dados migrado com sucesso.");
 }

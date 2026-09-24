@@ -31,6 +31,23 @@ const mem = {
   agentMemberLinks: [], // {id, club_id, member_user_id, agent_wallet_id, linked_from, linked_until, changed_by, created_at}
   rakeEvents: [], // {id, club_id, member_user_id, table_code, gross_amount, rakeback_rate, rakeback_amount, net_amount, agent_wallet_id, commission_rate, commission_amount, club_result, closing_id, created_at}
   rakeClosings: [], // {id, club_id, type, period_start, period_end, closed_at, closed_by, gross_rake, rakeback_total, commission_total, club_result, status}
+  diamondPackages: [], // {id, diamonds, coin_cost, bonus_diamonds, active, sort_order, created_at, updated_at}
+  diamondTransactions: [], // {id, user_id, type, diamonds_delta, balance_before, balance_after, amount_brl, payment_method, channel, note, admin_id, created_at}
+  commercialConditions: [], // {id, club_id, model, platform_rake_percent, club_rake_percent, renewal_price_brl, renewal_periodicity_days, transfer_fee_percent, diamond_discount_percent, member_limit, table_limit, benefits, starts_at, ends_at, active, created_by, reason, created_at}
+  clubLevelConfigs: [
+    { level: 0, gestor_cap: 1, membro_cap: 10, price_diamonds: 0 },
+    { level: 1, gestor_cap: 3, membro_cap: 60, price_diamonds: 1500 },
+    { level: 2, gestor_cap: 4, membro_cap: 100, price_diamonds: 2500 },
+    { level: 3, gestor_cap: 5, membro_cap: 150, price_diamonds: 4000 },
+    { level: 4, gestor_cap: 6, membro_cap: 250, price_diamonds: 8000 },
+    { level: 5, gestor_cap: 10, membro_cap: 600, price_diamonds: 20000 },
+    { level: 6, gestor_cap: 12, membro_cap: 800, price_diamonds: 30000 },
+    { level: 7, gestor_cap: 15, membro_cap: 1200, price_diamonds: 45000 },
+    { level: 8, gestor_cap: 20, membro_cap: 1500, price_diamonds: 60000 },
+    { level: 9, gestor_cap: 25, membro_cap: 1800, price_diamonds: 80000 },
+    { level: 10, gestor_cap: 50, membro_cap: 2500, price_diamonds: 110000 },
+  ],
+  adminAuditLogs: [], // {id, admin_id, action, target_type, target_id, before_json, after_json, reason, created_at}
   nextUserId: 1,
   nextClubId: 1,
   nextClubTableId: 1,
@@ -47,6 +64,10 @@ const mem = {
   nextAgentMemberLinkId: 1,
   nextRakeEventId: 1,
   nextRakeClosingId: 1,
+  nextDiamondPackageId: 1,
+  nextDiamondTransactionId: 1,
+  nextCommercialConditionId: 1,
+  nextAdminAuditLogId: 1,
 };
 
 const QUICK_WALLET_START = 50000;
@@ -1499,17 +1520,29 @@ export async function closeRakePeriod(clubId, type, periodStart, periodEnd, clos
 }
 
 export async function listRakeClosings(clubId) {
+  // Traz o username de quem fechou (closed_by é só o ID) — importante
+  // pro dono ver se foi ele mesmo ou algum Gestor que fechou o período.
   if (hasDatabase) {
-    const { rows } = await pool.query("SELECT * FROM rake_closings WHERE club_id=$1 ORDER BY closed_at DESC", [clubId]);
+    const { rows } = await pool.query(
+      `SELECT rc.*, u.username AS closed_by_username FROM rake_closings rc
+       LEFT JOIN users u ON u.id = rc.closed_by WHERE rc.club_id=$1 ORDER BY rc.closed_at DESC`,
+      [clubId]
+    );
     return rows;
   }
-  return mem.rakeClosings.filter((c) => c.club_id === clubId).sort((a, b) => new Date(b.closed_at) - new Date(a.closed_at));
+  return mem.rakeClosings.filter((c) => c.club_id === clubId)
+    .map((c) => ({ ...c, closed_by_username: mem.users.find((u) => u.id === c.closed_by)?.username }))
+    .sort((a, b) => new Date(b.closed_at) - new Date(a.closed_at));
 }
 
 export async function getRakeClosingDetail(closingId) {
   let closing, events;
   if (hasDatabase) {
-    const c = await pool.query("SELECT * FROM rake_closings WHERE id=$1", [closingId]);
+    const c = await pool.query(
+      `SELECT rc.*, u.username AS closed_by_username FROM rake_closings rc
+       LEFT JOIN users u ON u.id = rc.closed_by WHERE rc.id=$1`,
+      [closingId]
+    );
     closing = c.rows[0];
     const e = await pool.query(
       `SELECT re.*, u.username FROM rake_events re JOIN users u ON u.id = re.member_user_id WHERE re.closing_id=$1`,
@@ -1518,6 +1551,7 @@ export async function getRakeClosingDetail(closingId) {
     events = e.rows;
   } else {
     closing = mem.rakeClosings.find((c) => c.id === Number(closingId));
+    if (closing) closing = { ...closing, closed_by_username: mem.users.find((u) => u.id === closing.closed_by)?.username };
     events = mem.rakeEvents.filter((e) => e.closing_id === Number(closingId)).map((e) => ({ ...e, username: mem.users.find((u) => u.id === e.member_user_id)?.username }));
   }
   return { closing, events };
@@ -1544,5 +1578,352 @@ export async function getAgentWalletSummary(clubId, agentWalletId, from, to) {
     commission: filtered.reduce((s, e) => s + e.commission_amount, 0),
     pending: filtered.filter((e) => !e.closing_id).reduce((s, e) => s + e.commission_amount, 0),
     paid: filtered.filter((e) => e.closing_id).reduce((s, e) => s + e.commission_amount, 0),
+  };
+}
+
+// ============================================================
+// ROYALLE MASTER — painel administrativo da plataforma. Tudo daqui pra
+// baixo é NOVO (aditivo), nada troca o que já existia acima.
+// ============================================================
+
+export async function getUserPlatformRole(userId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("SELECT platform_role FROM users WHERE id=$1", [userId]);
+    return rows[0]?.platform_role || null;
+  }
+  return mem.users.find((u) => u.id === Number(userId))?.platform_role || null;
+}
+
+// ---- clubes (visão de fora, pra qualquer clube) ----
+
+export async function listAllClubsForMaster() {
+  if (hasDatabase) {
+    const { rows } = await pool.query(`
+      SELECT c.*, u.username AS owner_username,
+        (SELECT COUNT(*) FROM club_members cm WHERE cm.club_id = c.id) AS member_count,
+        (SELECT COUNT(*) FROM club_members cm WHERE cm.club_id = c.id AND cm.role = 'agent') AS agent_count
+      FROM clubs c JOIN users u ON u.id = c.owner_id
+      ORDER BY c.created_at DESC
+    `);
+    return rows;
+  }
+  return mem.clubs.map((c) => ({
+    ...c,
+    owner_username: mem.users.find((u) => u.id === c.owner_id)?.username || null,
+    member_count: mem.members.filter((m) => m.club_id === c.id).length,
+    agent_count: mem.members.filter((m) => m.club_id === c.id && m.role === "agent").length,
+  })).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+}
+
+export async function getClubForMasterDetail(clubId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(`
+      SELECT c.*, u.username AS owner_username FROM clubs c JOIN users u ON u.id = c.owner_id WHERE c.id=$1
+    `, [clubId]);
+    return rows[0] || null;
+  }
+  const c = mem.clubs.find((c) => c.id === Number(clubId));
+  if (!c) return null;
+  return { ...c, owner_username: mem.users.find((u) => u.id === c.owner_id)?.username || null };
+}
+
+export async function setClubStatus(clubId, status) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("UPDATE clubs SET status=$2 WHERE id=$1 RETURNING status", [clubId, status]);
+    return rows[0]?.status || null;
+  }
+  const c = mem.clubs.find((c) => c.id === Number(clubId));
+  if (!c) return null;
+  c.status = status;
+  return status;
+}
+
+// ---- usuários (visão de fora) ----
+
+export async function listAllUsersForMaster() {
+  if (hasDatabase) {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.username, u.avatar, u.platform_role, u.status, u.created_at, u.last_seen,
+        (SELECT COUNT(*) FROM club_members cm WHERE cm.user_id = u.id) AS club_count,
+        (SELECT COUNT(*) FROM clubs c WHERE c.owner_id = u.id) AS owned_club_count
+      FROM users u ORDER BY u.created_at DESC
+    `);
+    return rows;
+  }
+  return mem.users.map((u) => ({
+    id: u.id, username: u.username, avatar: u.avatar, platform_role: u.platform_role || null,
+    status: u.status || "active", created_at: u.created_at, last_seen: u.last_seen,
+    club_count: mem.members.filter((m) => m.user_id === u.id).length,
+    owned_club_count: mem.clubs.filter((c) => c.owner_id === u.id).length,
+  })).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+}
+
+export async function getUserForMasterDetail(userId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("SELECT id, username, avatar, platform_role, status, created_at, last_seen FROM users WHERE id=$1", [userId]);
+    if (!rows[0]) return null;
+    const clubs = await pool.query(`
+      SELECT c.id, c.code, c.name, cm.role, cm.chips FROM club_members cm JOIN clubs c ON c.id = cm.club_id WHERE cm.user_id = $1
+    `, [userId]);
+    return { ...rows[0], clubs: clubs.rows };
+  }
+  const u = mem.users.find((u) => u.id === Number(userId));
+  if (!u) return null;
+  const clubs = mem.members.filter((m) => m.user_id === Number(userId)).map((m) => {
+    const c = mem.clubs.find((c) => c.id === m.club_id);
+    return { id: c?.id, code: c?.code, name: c?.name, role: m.role, chips: m.chips };
+  });
+  return { id: u.id, username: u.username, avatar: u.avatar, platform_role: u.platform_role || null, status: u.status || "active", created_at: u.created_at, last_seen: u.last_seen, clubs };
+}
+
+export async function setUserStatus(userId, status) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("UPDATE users SET status=$2 WHERE id=$1 RETURNING status", [userId, status]);
+    return rows[0]?.status || null;
+  }
+  const u = mem.users.find((u) => u.id === Number(userId));
+  if (!u) return null;
+  u.status = status;
+  return status;
+}
+
+// ---- pacotes de diamante ----
+
+export async function listDiamondPackages(onlyActive = false) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT * FROM diamond_packages ${onlyActive ? "WHERE active = true" : ""} ORDER BY sort_order, id`
+    );
+    return rows;
+  }
+  return mem.diamondPackages.filter((p) => !onlyActive || p.active).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+}
+
+export async function createDiamondPackage({ diamonds, coinCost, bonusDiamonds = 0, sortOrder = 0 }) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO diamond_packages (diamonds, coin_cost, bonus_diamonds, sort_order) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [diamonds, coinCost, bonusDiamonds, sortOrder]
+    );
+    return rows[0];
+  }
+  const p = { id: mem.nextDiamondPackageId++, diamonds, coin_cost: coinCost, bonus_diamonds: bonusDiamonds, active: true, sort_order: sortOrder, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  mem.diamondPackages.push(p);
+  return p;
+}
+
+export async function updateDiamondPackage(id, fields) {
+  const cols = Object.keys(fields);
+  if (cols.length === 0) return null;
+  const colMap = { diamonds: "diamonds", coinCost: "coin_cost", bonusDiamonds: "bonus_diamonds", active: "active", sortOrder: "sort_order" };
+  if (hasDatabase) {
+    const setSql = cols.map((k, i) => `${colMap[k] || k} = $${i + 2}`).join(", ") + ", updated_at = now()";
+    const { rows } = await pool.query(`UPDATE diamond_packages SET ${setSql} WHERE id=$1 RETURNING *`, [id, ...cols.map((k) => fields[k])]);
+    return rows[0] || null;
+  }
+  const p = mem.diamondPackages.find((p) => p.id === Number(id));
+  if (!p) return null;
+  cols.forEach((k) => { p[colMap[k] || k] = fields[k]; });
+  p.updated_at = new Date().toISOString();
+  return p;
+}
+
+// ---- ledger de diamante (nunca só soma saldo — sempre via aqui) ----
+
+export async function creditDiamondsWithLedger(userId, delta, { type, amountBrl = null, paymentMethod = null, channel = null, note = null, adminId = null }) {
+  const before = await getOrCreateQuickWallet(userId);
+  const balanceBefore = before.gems;
+  const balanceAfter = await adjustQuickWalletGems(userId, delta);
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO diamond_transactions (user_id, type, diamonds_delta, balance_before, balance_after, amount_brl, payment_method, channel, note, admin_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [userId, type, delta, balanceBefore, balanceAfter, amountBrl, paymentMethod, channel, note, adminId]
+    );
+    return { transaction: rows[0], balanceAfter };
+  }
+  const tx = {
+    id: mem.nextDiamondTransactionId++, user_id: userId, type, diamonds_delta: delta,
+    balance_before: balanceBefore, balance_after: balanceAfter, amount_brl: amountBrl,
+    payment_method: paymentMethod, channel, note, admin_id: adminId, created_at: new Date().toISOString(),
+  };
+  mem.diamondTransactions.push(tx);
+  return { transaction: tx, balanceAfter };
+}
+
+export async function listDiamondTransactions({ userId = null, limit = 100 } = {}) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT dt.*, u.username, a.username AS admin_username FROM diamond_transactions dt
+       JOIN users u ON u.id = dt.user_id LEFT JOIN users a ON a.id = dt.admin_id
+       ${userId ? "WHERE dt.user_id = $2" : ""} ORDER BY dt.created_at DESC LIMIT $1`,
+      userId ? [limit, userId] : [limit]
+    );
+    return rows;
+  }
+  return mem.diamondTransactions
+    .filter((t) => !userId || t.user_id === Number(userId))
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, limit)
+    .map((t) => ({ ...t, username: mem.users.find((u) => u.id === t.user_id)?.username, admin_username: mem.users.find((u) => u.id === t.admin_id)?.username }));
+}
+
+// ---- condição comercial por clube ----
+
+export async function getActiveCommercialCondition(clubId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT * FROM club_commercial_conditions WHERE club_id=$1 AND active=true AND (ends_at IS NULL OR ends_at > now())
+       ORDER BY id DESC LIMIT 1`,
+      [clubId]
+    );
+    return rows[0] || null;
+  }
+  return mem.commercialConditions
+    .filter((c) => c.club_id === Number(clubId) && c.active && (!c.ends_at || new Date(c.ends_at) > new Date()))
+    .sort((a, b) => b.id - a.id)[0] || null;
+}
+
+export async function listCommercialConditionHistory(clubId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT cc.*, u.username AS created_by_username FROM club_commercial_conditions cc
+       LEFT JOIN users u ON u.id = cc.created_by WHERE cc.club_id=$1 ORDER BY cc.id DESC`,
+      [clubId]
+    );
+    return rows;
+  }
+  return mem.commercialConditions.filter((c) => c.club_id === Number(clubId))
+    .map((c) => ({ ...c, created_by_username: mem.users.find((u) => u.id === c.created_by)?.username }))
+    .sort((a, b) => b.id - a.id);
+}
+
+// Cria uma condição nova e desativa a anterior — nunca sobrescreve, o
+// histórico fica todo guardado (pedido explícito).
+export async function setClubCommercialCondition(clubId, fields, createdBy, reason) {
+  const {
+    model = "standard", platformRakePercent, clubRakePercent, renewalPriceBrl = null, renewalPeriodicityDays = null,
+    transferFeePercent, diamondDiscountPercent = 0, memberLimit = null, tableLimit = null, benefits = null, endsAt = null,
+  } = fields;
+  if (hasDatabase) {
+    await pool.query(`UPDATE club_commercial_conditions SET active=false WHERE club_id=$1 AND active=true`, [clubId]);
+    const { rows } = await pool.query(
+      `INSERT INTO club_commercial_conditions
+        (club_id, model, platform_rake_percent, club_rake_percent, renewal_price_brl, renewal_periodicity_days,
+         transfer_fee_percent, diamond_discount_percent, member_limit, table_limit, benefits, ends_at, created_by, reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [clubId, model, platformRakePercent, clubRakePercent, renewalPriceBrl, renewalPeriodicityDays,
+        transferFeePercent, diamondDiscountPercent, memberLimit, tableLimit, benefits, endsAt, createdBy, reason]
+    );
+    return rows[0];
+  }
+  mem.commercialConditions.forEach((c) => { if (c.club_id === Number(clubId)) c.active = false; });
+  const row = {
+    id: mem.nextCommercialConditionId++, club_id: Number(clubId), model,
+    platform_rake_percent: platformRakePercent, club_rake_percent: clubRakePercent,
+    renewal_price_brl: renewalPriceBrl, renewal_periodicity_days: renewalPeriodicityDays,
+    transfer_fee_percent: transferFeePercent, diamond_discount_percent: diamondDiscountPercent,
+    member_limit: memberLimit, table_limit: tableLimit, benefits, starts_at: new Date().toISOString(),
+    ends_at: endsAt, active: true, created_by: createdBy, reason, created_at: new Date().toISOString(),
+  };
+  mem.commercialConditions.push(row);
+  return row;
+}
+
+// ---- nível de clube configurável ----
+
+export async function listClubLevelConfigs() {
+  if (hasDatabase) {
+    const { rows } = await pool.query("SELECT * FROM club_level_configs ORDER BY level");
+    return rows;
+  }
+  return [...mem.clubLevelConfigs].sort((a, b) => a.level - b.level);
+}
+
+export async function setClubLevelConfig(level, { gestorCap, membroCap, priceDiamonds, benefits }, updatedBy) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO club_level_configs (level, gestor_cap, membro_cap, price_diamonds, benefits, updated_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6, now())
+       ON CONFLICT (level) DO UPDATE SET gestor_cap=$2, membro_cap=$3, price_diamonds=$4, benefits=$5, updated_by=$6, updated_at=now()
+       RETURNING *`,
+      [level, gestorCap, membroCap, priceDiamonds, benefits || null, updatedBy]
+    );
+    return rows[0];
+  }
+  let row = mem.clubLevelConfigs.find((c) => c.level === Number(level));
+  if (!row) { row = { level: Number(level) }; mem.clubLevelConfigs.push(row); }
+  Object.assign(row, { gestor_cap: gestorCap, membro_cap: membroCap, price_diamonds: priceDiamonds, benefits: benefits || null, updated_by: updatedBy, updated_at: new Date().toISOString() });
+  return row;
+}
+
+// ---- log de auditoria ----
+
+export async function recordAdminAuditLog({ adminId, action, targetType = null, targetId = null, before = null, after = null, reason = null }) {
+  if (hasDatabase) {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, before_json, after_json, reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [adminId, action, targetType, targetId != null ? String(targetId) : null, before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null, reason]
+    );
+    return;
+  }
+  mem.adminAuditLogs.push({
+    id: mem.nextAdminAuditLogId++, admin_id: adminId, action, target_type: targetType,
+    target_id: targetId != null ? String(targetId) : null, before_json: before, after_json: after,
+    reason, created_at: new Date().toISOString(),
+  });
+}
+
+export async function listAdminAuditLogs({ limit = 200 } = {}) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT al.*, u.username AS admin_username FROM admin_audit_logs al
+       LEFT JOIN users u ON u.id = al.admin_id ORDER BY al.created_at DESC LIMIT $1`,
+      [limit]
+    );
+    return rows;
+  }
+  return mem.adminAuditLogs
+    .map((l) => ({ ...l, admin_username: mem.users.find((u) => u.id === l.admin_id)?.username }))
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, limit);
+}
+
+// ---- resumo financeiro da plataforma inteira (todos os clubes) ----
+
+export async function getPlatformFinancialSummary(from, to) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(gross_amount),0) AS gross_rake, COALESCE(SUM(rakeback_amount),0) AS rakeback_total,
+              COALESCE(SUM(commission_amount),0) AS commission_total, COALESCE(SUM(club_result),0) AS club_result_total,
+              COUNT(DISTINCT club_id) AS clubs_with_activity
+       FROM rake_events WHERE created_at BETWEEN $1 AND $2`,
+      [from, to]
+    );
+    const diamondRows = await pool.query(
+      `SELECT COALESCE(SUM(amount_brl),0) AS revenue_brl, COALESCE(SUM(diamonds_delta),0) AS diamonds_sold, COUNT(*) AS transaction_count
+       FROM diamond_transactions WHERE type = 'manual_sale' AND created_at BETWEEN $1 AND $2`,
+      [from, to]
+    );
+    return {
+      grossRake: Number(rows[0].gross_rake), rakebackTotal: Number(rows[0].rakeback_total),
+      commissionTotal: Number(rows[0].commission_total), clubResultTotal: Number(rows[0].club_result_total),
+      clubsWithActivity: Number(rows[0].clubs_with_activity),
+      diamondRevenueBrl: Number(diamondRows.rows[0].revenue_brl), diamondsSold: Number(diamondRows.rows[0].diamonds_sold),
+      diamondTransactionCount: Number(diamondRows.rows[0].transaction_count),
+    };
+  }
+  const events = mem.rakeEvents.filter((e) => inRange(e.created_at, from, to));
+  const diamondSales = mem.diamondTransactions.filter((t) => t.type === "manual_sale" && inRange(t.created_at, from, to));
+  return {
+    grossRake: events.reduce((s, e) => s + e.gross_amount, 0),
+    rakebackTotal: events.reduce((s, e) => s + e.rakeback_amount, 0),
+    commissionTotal: events.reduce((s, e) => s + e.commission_amount, 0),
+    clubResultTotal: events.reduce((s, e) => s + e.club_result, 0),
+    clubsWithActivity: new Set(events.map((e) => e.club_id)).size,
+    diamondRevenueBrl: diamondSales.reduce((s, t) => s + Number(t.amount_brl || 0), 0),
+    diamondsSold: diamondSales.reduce((s, t) => s + t.diamonds_delta, 0),
+    diamondTransactionCount: diamondSales.length,
   };
 }
