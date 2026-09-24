@@ -735,11 +735,11 @@ export async function findUserByUsername(username) {
 
 export async function findUserById(id) {
   if (hasDatabase) {
-    const { rows } = await pool.query("SELECT id, username, avatar, avatar_image, nickname FROM users WHERE id = $1", [id]);
+    const { rows } = await pool.query("SELECT id, username, avatar, avatar_image, nickname, platform_role, status FROM users WHERE id = $1", [id]);
     return rows[0] || null;
   }
   const u = mem.users.find((u) => u.id === id);
-  return u ? { id: u.id, username: u.username, avatar: u.avatar, avatar_image: u.avatar_image || null, nickname: u.nickname || null } : null;
+  return u ? { id: u.id, username: u.username, avatar: u.avatar, avatar_image: u.avatar_image || null, nickname: u.nickname || null, platform_role: u.platform_role || null, status: u.status || "active" } : null;
 }
 
 export async function createClub({ code, name, ownerId, smallBlind, bigBlind, buyIn, rakePercent }) {
