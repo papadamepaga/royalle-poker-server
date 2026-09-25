@@ -32,9 +32,11 @@ import {
   getUserPlatformRole, listAllClubsForMaster, getClubForMasterDetail, setClubStatus,
   listAllUsersForMaster, getUserForMasterDetail, setUserStatus,
   listDiamondPackages, createDiamondPackage, updateDiamondPackage, creditDiamondsWithLedger, listDiamondTransactions,
+  listCoinPackages, createCoinPackage, updateCoinPackage, adjustQuickWalletTimeBanks, adjustQuickWalletRabbitHunts,
   getActiveCommercialCondition, listCommercialConditionHistory, setClubCommercialCondition,
   listClubLevelConfigs, setClubLevelConfig,
   recordAdminAuditLog, listAdminAuditLogs, getPlatformFinancialSummary,
+  listClubChipPackages, createClubChipPackage, updateClubChipPackage, creditClubChipsWithLedger, listClubChipTransactions,
 } from "./store.js";
 import { MAX_SEATS, makeBotId, pickBotName, pickBotAction } from "./bots.js";
 
@@ -1701,6 +1703,215 @@ async function handleMessage(ws, msg, ctx) {
     return;
   }
 
+  // Loja de diamante — pública (qualquer logado), só os pacotes ativos.
+  // O front usava uma lista fixa até agora; isso deixa configurável
+  // pelo Royalle Master de verdade.
+  if (type === "list_diamond_packages") {
+    if (!requireAuth(ws, ctx)) return;
+    const packages = await listDiamondPackages(true);
+    ctx.reply({ ok: true, packages });
+    return;
+  }
+
+  if (type === "list_coin_packages") {
+    if (!requireAuth(ws, ctx)) return;
+    const packages = await listCoinPackages(true);
+    ctx.reply({ ok: true, packages });
+    return;
+  }
+
+  // Comprar diamante com Royalle Coin — faltava esse handler inteiro
+  // (o botão da Loja não fazia nada). Gera ledger de verdade (mesmo
+  // princípio de nunca só somar saldo) com type 'app_purchase'.
+  if (type === "buy_diamonds") {
+    if (!requireAuth(ws, ctx)) return;
+    const pkg = (await listDiamondPackages(true)).find((p) => p.id === Number(msg.itemId));
+    if (!pkg) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.chips < pkg.coin_cost) return ctx.reply({ ok: false, error: "Royalle Coin insuficiente." });
+    await adjustQuickWalletChips(ws.userId, -pkg.coin_cost);
+    const totalDiamonds = pkg.diamonds + Number(pkg.bonus_diamonds || 0);
+    const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, totalDiamonds, { type: "app_purchase", channel: "app" });
+    ctx.reply({ ok: true, diamonds: totalDiamonds, gems: balanceAfter, coinsSpent: pkg.coin_cost, coins: wallet.chips - pkg.coin_cost });
+    return;
+  }
+
+  // "Ouro" — o inverso da loja de diamante: paga com diamante, recebe
+  // Royalle Coin. Fica registrado no MESMO ledger de diamante (é uma
+  // saída de diamante, só que o destino é Coin em vez de dinheiro real)
+  // — assim já aparece de graça no histórico de compras do jogador.
+  if (type === "buy_coins") {
+    if (!requireAuth(ws, ctx)) return;
+    const pkg = (await listCoinPackages(true)).find((p) => p.id === Number(msg.itemId));
+    if (!pkg) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.gems < pkg.diamond_cost) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
+    const totalCoins = Number(pkg.coins) + Number(pkg.bonus_coins || 0);
+    const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -pkg.diamond_cost, {
+      type: "buy_coins", note: `Trocou por ${totalCoins.toLocaleString("pt-BR")} Royalle Coin`, channel: "app",
+    });
+    const newChips = await adjustQuickWalletChips(ws.userId, totalCoins);
+    ctx.reply({ ok: true, coins: totalCoins, chips: newChips, gems: balanceAfter });
+    return;
+  }
+
+  if (type === "master_list_coin_packages") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const packages = await listCoinPackages(false);
+    ctx.reply({ ok: true, packages });
+    return;
+  }
+
+  if (type === "master_create_coin_package") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const coins = Math.max(1, Number(msg.coins) || 0);
+    const diamondCost = Math.max(1, Number(msg.diamondCost) || 0);
+    const bonusCoins = Math.max(0, Number(msg.bonusCoins) || 0);
+    const pkg = await createCoinPackage({ coins, diamondCost, bonusCoins, sortOrder: Number(msg.sortOrder) || 0 });
+    await recordAdminAuditLog({ adminId: ws.userId, action: "create_coin_package", targetType: "coin_package", targetId: pkg.id, after: pkg });
+    ctx.reply({ ok: true, package: pkg });
+    return;
+  }
+
+  if (type === "master_update_coin_package") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const before = (await listCoinPackages(false)).find((p) => p.id === Number(msg.packageId));
+    if (!before) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
+    const fields = {};
+    if (msg.coins != null) fields.coins = Math.max(1, Number(msg.coins));
+    if (msg.diamondCost != null) fields.diamondCost = Math.max(1, Number(msg.diamondCost));
+    if (msg.bonusCoins != null) fields.bonusCoins = Math.max(0, Number(msg.bonusCoins));
+    if (msg.active != null) fields.active = !!msg.active;
+    if (msg.sortOrder != null) fields.sortOrder = Number(msg.sortOrder);
+    const pkg = await updateCoinPackage(msg.packageId, fields);
+    await recordAdminAuditLog({ adminId: ws.userId, action: "update_coin_package", targetType: "coin_package", targetId: pkg.id, before, after: pkg });
+    ctx.reply({ ok: true, package: pkg });
+    return;
+  }
+
+  // Time Bank — compra na loja com diamante, some pro histórico de
+  // compras igual tudo mais. O saldo mora na carteira do usuário (vale
+  // em qualquer mesa); o USO de verdade (+15s na própria vez de agir)
+  // é um handler à parte, mais abaixo, perto da ação de jogo.
+  const TIME_BANK_DIAMOND_COST = 30;
+  if (type === "buy_time_bank") {
+    if (!requireAuth(ws, ctx)) return;
+    const qty = Math.max(1, Number(msg.quantity) || 1);
+    const cost = TIME_BANK_DIAMOND_COST * qty;
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.gems < cost) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
+    const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -cost, { type: "buy_timebank", note: `Comprou ${qty} Time Bank`, channel: "app" });
+    const timeBanks = await adjustQuickWalletTimeBanks(ws.userId, qty);
+    ctx.reply({ ok: true, timeBanks, gems: balanceAfter });
+    return;
+  }
+
+  // Loja de ficha de clube — pública, só dono vê sentido mas qualquer
+  // logado pode listar os pacotes disponíveis (preço em diamante).
+  if (type === "list_club_chip_packages") {
+    if (!requireAuth(ws, ctx)) return;
+    const packages = await listClubChipPackages(true);
+    ctx.reply({ ok: true, packages });
+    return;
+  }
+
+  // Dono do clube recarrega a TESOURARIA do próprio clube pagando com
+  // diamante — canal dentro do app (o outro canal é a venda manual do
+  // Master, por fora, ver master_manual_chip_sale).
+  if (type === "buy_club_chips") {
+    if (!requireAuth(ws, ctx)) return;
+    const club = await getClubByCode((msg.code || "").toUpperCase());
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const me = await getMember(club.id, ws.userId);
+    if (!me || me.role !== "owner") return ctx.reply({ ok: false, error: "Só o dono do clube pode recarregar a tesouraria." });
+    const pkg = (await listClubChipPackages(true)).find((p) => p.id === Number(msg.packageId));
+    if (!pkg) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.gems < pkg.diamond_cost) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
+    await adjustQuickWalletGems(ws.userId, -pkg.diamond_cost);
+    const totalChips = Number(pkg.chips) + Number(pkg.bonus_chips || 0);
+    const { transaction, balanceAfter } = await creditClubChipsWithLedger(club.id, totalChips, {
+      type: "app_purchase", diamondCost: pkg.diamond_cost, channel: "app", buyerUserId: ws.userId,
+    });
+    ctx.reply({ ok: true, chips: totalChips, treasuryChips: balanceAfter, diamondsSpent: pkg.diamond_cost, gems: wallet.gems - pkg.diamond_cost, transaction });
+    return;
+  }
+
+  // ---- Royalle Master: ficha de clube (pacotes + venda manual) ----
+
+  if (type === "master_list_club_chip_packages") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const packages = await listClubChipPackages(false);
+    ctx.reply({ ok: true, packages });
+    return;
+  }
+
+  if (type === "master_create_club_chip_package") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const chips = Math.max(1, Number(msg.chips) || 0);
+    const diamondCost = Math.max(1, Number(msg.diamondCost) || 0);
+    const bonusChips = Math.max(0, Number(msg.bonusChips) || 0);
+    const pkg = await createClubChipPackage({ chips, diamondCost, bonusChips, sortOrder: Number(msg.sortOrder) || 0 });
+    await recordAdminAuditLog({ adminId: ws.userId, action: "create_club_chip_package", targetType: "club_chip_package", targetId: pkg.id, after: pkg });
+    ctx.reply({ ok: true, package: pkg });
+    return;
+  }
+
+  if (type === "master_update_club_chip_package") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const before = (await listClubChipPackages(false)).find((p) => p.id === Number(msg.packageId));
+    if (!before) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
+    const fields = {};
+    if (msg.chips != null) fields.chips = Math.max(1, Number(msg.chips));
+    if (msg.diamondCost != null) fields.diamondCost = Math.max(1, Number(msg.diamondCost));
+    if (msg.bonusChips != null) fields.bonusChips = Math.max(0, Number(msg.bonusChips));
+    if (msg.active != null) fields.active = !!msg.active;
+    if (msg.sortOrder != null) fields.sortOrder = Number(msg.sortOrder);
+    const pkg = await updateClubChipPackage(msg.packageId, fields);
+    await recordAdminAuditLog({ adminId: ws.userId, action: "update_club_chip_package", targetType: "club_chip_package", targetId: pkg.id, before, after: pkg });
+    ctx.reply({ ok: true, package: pkg });
+    return;
+  }
+
+  // Venda manual de ficha pro clube — dinheiro real recebido por fora
+  // (WhatsApp/PIX), credita direto na tesouraria do clube, com ledger.
+  if (type === "master_manual_chip_sale") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const club = await getClubForMasterDetail(Number(msg.clubId));
+    if (!club) return ctx.reply({ ok: false, error: "Clube não encontrado." });
+    const chips = Math.round(Number(msg.chips));
+    if (!(chips > 0)) return ctx.reply({ ok: false, error: "Quantidade de fichas inválida." });
+    const amountBrl = msg.amountBrl != null ? Number(msg.amountBrl) : null;
+    const { transaction, balanceAfter } = await creditClubChipsWithLedger(club.id, chips, {
+      type: "manual_sale", amountBrl, paymentMethod: msg.paymentMethod || null, channel: msg.channel || "whatsapp",
+      note: msg.note || null, adminId: ws.userId,
+    });
+    await recordAdminAuditLog({ adminId: ws.userId, action: "manual_chip_sale", targetType: "club", targetId: club.id, after: transaction, reason: msg.note || null });
+    ctx.reply({ ok: true, transaction, balanceAfter });
+    return;
+  }
+
+  if (type === "master_list_club_chip_transactions") {
+    if (!(await requireSuperAdmin(ws, ctx))) return;
+    const transactions = await listClubChipTransactions({ clubId: msg.clubId ? Number(msg.clubId) : null, limit: Math.min(500, Number(msg.limit) || 200) });
+    ctx.reply({ ok: true, transactions });
+    return;
+  }
+
+  // Histórico de compras do PRÓPRIO jogador — diamante (Coin→diamante)
+  // e, se for dono de algum clube, ficha (diamante→tesouraria). Mesmo
+  // ledger que o Master usa, só filtrado pro usuário logado.
+  if (type === "list_my_purchases") {
+    if (!requireAuth(ws, ctx)) return;
+    const diamondHistory = await listDiamondTransactions({ userId: ws.userId, limit: 100 });
+    const ownedClubs = await listAllClubsForMaster().catch(() => []); // fallback defensivo, não deveria falhar
+    const myOwnedClubIds = ownedClubs.filter((c) => c.owner_id === ws.userId).map((c) => c.id);
+    const chipHistoryLists = await Promise.all(myOwnedClubIds.map((id) => listClubChipTransactions({ clubId: id, limit: 50 })));
+    const chipHistory = chipHistoryLists.flat().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    ctx.reply({ ok: true, diamondHistory, chipHistory });
+    return;
+  }
+
   // Jackpot do clube — liga/desliga e define quanto % do rake do clube
   // (não do total, só da fatia que já seria dele) alimenta o pote.
   if (type === "set_jackpot_config") {
@@ -2990,6 +3201,8 @@ async function handleMessage(ws, msg, ctx) {
       ok: true,
       chips: wallet.chips,
       gems: wallet.gems,
+      timeBanks: wallet.timeBanks || 0,
+      rabbitHunts: wallet.rabbitHunts || 0,
       canClaimDaily: lastClaim !== today,
       stats: { handsPlayed: Number(stats.hands_played), handsWon: Number(stats.hands_won) },
     });
@@ -3216,6 +3429,68 @@ async function handleMessage(ws, msg, ctx) {
     const result = rt.table.applyAction(username, msg.action, msg.amount);
     broadcastTable(code);
     ctx.reply(result?.error ? { ok: false, error: result.error } : { ok: true });
+    return;
+  }
+
+  // Time Bank de verdade: gasta 1 do saldo (comprado na loja) e ganha
+  // +15s na PRÓPRIA vez de agir — empurra o relógio de inatividade do
+  // servidor (rt._actingSince) e avisa o cliente via
+  // table.timeBankExtension (um contador que só sobe) pra ele somar
+  // 15s no cronômetro que já está mostrando.
+  const TIME_BANK_EXTRA_MS = 15000;
+  if (type === "use_time_bank") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const username = rt.socketToPlayer.get(ws);
+    if (!username || rt.table.actingId !== username) return ctx.reply({ ok: false, error: "Só dá pra usar na sua própria vez de agir." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.timeBanks < 1) return ctx.reply({ ok: false, error: "Você não tem Time Bank." });
+    const timeBanks = await adjustQuickWalletTimeBanks(ws.userId, -1);
+    rt._actingSince = (rt._actingSince || Date.now()) + TIME_BANK_EXTRA_MS;
+    rt.table.timeBankExtension = (rt.table.timeBankExtension || 0) + 1;
+    broadcastTable(code);
+    ctx.reply({ ok: true, timeBanks });
+    return;
+  }
+
+  // Caça ao Coelho: compra o estoque antes (na loja, com diamante,
+  // igual Time Bank) — usar de verdade só consome 1 do estoque, sem
+  // cobrar na hora. Só depois de desistir numa mão ainda em andamento;
+  // mostra as cartas que VÃO sair de verdade nessa mão (tira do topo do
+  // MESMO baralho que vai ser usado — não é sorteio à parte, nunca
+  // destoa do que realmente vai acontecer na mesa).
+  const RABBIT_HUNT_DIAMOND_COST = 15;
+  if (type === "buy_rabbit_hunt") {
+    if (!requireAuth(ws, ctx)) return;
+    const qty = Math.max(1, Number(msg.quantity) || 1);
+    const cost = RABBIT_HUNT_DIAMOND_COST * qty;
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.gems < cost) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
+    const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -cost, { type: "buy_rabbithunt", note: `Comprou ${qty} Caça ao Coelho`, channel: "app" });
+    const rabbitHunts = await adjustQuickWalletRabbitHunts(ws.userId, qty);
+    ctx.reply({ ok: true, rabbitHunts, gems: balanceAfter });
+    return;
+  }
+
+  if (type === "rabbit_hunt") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const username = rt.socketToPlayer.get(ws);
+    if (!username) return ctx.reply({ ok: false, error: "Você não está sentado." });
+    const table = rt.table;
+    const p = table.players.find((pl) => pl.id === username);
+    if (!p || !p.folded || table.stage === "idle") return ctx.reply({ ok: false, error: "Só dá pra caçar o coelho depois de desistir numa mão em andamento." });
+    const need = 5 - table.community.length;
+    if (need <= 0) return ctx.reply({ ok: false, error: "Não tem mais carta pra revelar nessa mão." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.rabbitHunts < 1) return ctx.reply({ ok: false, error: "Você não tem Caça ao Coelho no estoque." });
+    const rabbitHunts = await adjustQuickWalletRabbitHunts(ws.userId, -1);
+    const upcoming = [...table.deck].reverse().slice(0, need);
+    ctx.reply({ ok: true, cards: upcoming, rabbitHunts });
     return;
   }
 

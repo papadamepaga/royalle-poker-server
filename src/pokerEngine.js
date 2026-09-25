@@ -447,6 +447,11 @@ export class PokerTable {
     this.pendingRakeByPlayer = {}; // { playerId: quanto desse rake veio dele } — base do sistema de rakeback/comissão
     this.pendingPlatformRake = 0; // chips raked (parte do APP) na mão mais recente, ainda não gravados pelo caller
     this.allInRunout = false;
+    // Time Bank — contador que só sobe (nunca reseta aqui; o cliente
+    // que compara com actingId pra saber se é uma extensão do MESMO
+    // turno ou já é outro jogador agindo) — cada +1 significa "alguém
+    // acabou de gastar 1 Time Bank e ganhou +15s".
+    this.timeBankExtension = 0;
     // Run It Múltiplo ("Bater 2x/3x") — reaproveita a config existente
     // da mesa (this.runItMultiple, acima). Estado da decisão da mão
     // ATUAL, resetado a cada startHand(): runItCount null = ainda não
@@ -1225,6 +1230,7 @@ export class PokerTable {
       actingId: this.actingId,
       dealerId: this.dealerId,
       allInRunout: !!this.allInRunout,
+      timeBankExtension: this.timeBankExtension || 0,
       // Run It Múltiplo ("Bater 2x/3x") — runItPending true = mostra o
       // modal de escolha pros envolvidos; runItBoards preenchido só
       // depois que todo mundo concordou em >1 e a mão já foi resolvida

@@ -515,6 +515,69 @@ export async function migrate() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  {
+    const { rows } = await pool.query(`SELECT COUNT(*)::int AS n FROM diamond_packages`);
+    if (rows[0].n === 0) {
+      // Mesmos 6 pacotes que já estavam fixos na Loja do app — só pra
+      // não começar vazio; dá pra editar/adicionar pelo Royalle Master.
+      const seed = [[60, 1000], [300, 4500], [780, 11000], [1218, 16000], [2988, 38000], [6468, 80000]];
+      for (let i = 0; i < seed.length; i++) {
+        await pool.query(
+          `INSERT INTO diamond_packages (diamonds, coin_cost, sort_order) VALUES ($1,$2,$3)`,
+          [seed[i][0], seed[i][1], i]
+        );
+      }
+    }
+  }
+
+  // Pacotes de FICHA (Royalle Pay) pro DONO DE CLUBE recarregar a
+  // tesouraria do próprio clube, pagando com diamante — canal dentro
+  // do app. Separado dos pacotes de diamante (esses são fichas de
+  // clube, não Royalle Coin pessoal).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_chip_packages (
+      id SERIAL PRIMARY KEY,
+      chips BIGINT NOT NULL,
+      diamond_cost BIGINT NOT NULL,
+      bonus_chips BIGINT NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT true,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  {
+    const { rows } = await pool.query(`SELECT COUNT(*)::int AS n FROM club_chip_packages`);
+    if (rows[0].n === 0) {
+      const seed = [[50000, 100], [250000, 450], [600000, 1000], [1500000, 2400], [4000000, 6000]];
+      for (let i = 0; i < seed.length; i++) {
+        await pool.query(`INSERT INTO club_chip_packages (chips, diamond_cost, sort_order) VALUES ($1,$2,$3)`, [seed[i][0], seed[i][1], i]);
+      }
+    }
+  }
+
+  // Ledger de recarga de ficha do CLUBE — mesmo princípio do de
+  // diamante (nunca só soma saldo). type: 'app_purchase' (dono pagou
+  // com diamante, dentro do app) ou 'manual_sale' (Carlos vendeu por
+  // fora — PIX/WhatsApp — e creditou na mão, com R$ registrado).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS club_chip_transactions (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL REFERENCES clubs(id),
+      type TEXT NOT NULL,
+      chips_delta BIGINT NOT NULL,
+      balance_before BIGINT NOT NULL,
+      balance_after BIGINT NOT NULL,
+      amount_brl NUMERIC,
+      diamond_cost BIGINT,
+      payment_method TEXT,
+      channel TEXT,
+      note TEXT,
+      buyer_user_id INTEGER REFERENCES users(id),
+      admin_id INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
 
   // Ledger de diamante — igual ao padrão que o app já usa pra fichas
   // (pay_ledger) e rake (rake_events): nunca só soma saldo, sempre
@@ -624,6 +687,31 @@ export async function migrate() {
       [process.env.SUPER_ADMIN_USERNAME]
     );
   }
+
+  // "Ouro" — comprar Royalle Coin pagando com diamante (o inverso da
+  // loja de diamante, que já existia). Mesmo padrão de pacote
+  // configurável pelo Master.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS coin_packages (
+      id SERIAL PRIMARY KEY,
+      coins BIGINT NOT NULL,
+      diamond_cost INTEGER NOT NULL,
+      bonus_coins BIGINT NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT true,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Time Bank — cada jogador tem um saldo próprio (compra na loja com
+  // diamante), gasta 1 por vez pra ganhar +15s na própria vez de agir
+  // em QUALQUER mesa (cash ou torneio) — por isso mora na carteira do
+  // usuário, não em alguma mesa específica.
+  await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS time_banks INTEGER NOT NULL DEFAULT 0;`);
+  // Caça ao Coelho — mesmo esquema do Time Bank: compra o estoque na
+  // loja com diamante, consome 1 cada vez que usa de verdade (em vez de
+  // cobrar diamante na hora, no meio da mão).
+  await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS rabbit_hunts INTEGER NOT NULL DEFAULT 0;`);
 
   console.log("Banco de dados migrado com sucesso.");
 }

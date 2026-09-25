@@ -31,8 +31,21 @@ const mem = {
   agentMemberLinks: [], // {id, club_id, member_user_id, agent_wallet_id, linked_from, linked_until, changed_by, created_at}
   rakeEvents: [], // {id, club_id, member_user_id, table_code, gross_amount, rakeback_rate, rakeback_amount, net_amount, agent_wallet_id, commission_rate, commission_amount, club_result, closing_id, created_at}
   rakeClosings: [], // {id, club_id, type, period_start, period_end, closed_at, closed_by, gross_rake, rakeback_total, commission_total, club_result, status}
-  diamondPackages: [], // {id, diamonds, coin_cost, bonus_diamonds, active, sort_order, created_at, updated_at}
+  diamondPackages: [
+    [60, 1000], [300, 4500], [780, 11000], [1218, 16000], [2988, 38000], [6468, 80000],
+  ].map(([diamonds, coin_cost], i) => ({ id: i + 1, diamonds, coin_cost, bonus_diamonds: 0, active: true, sort_order: i, created_at: new Date().toISOString(), updated_at: new Date().toISOString() })),
   diamondTransactions: [], // {id, user_id, type, diamonds_delta, balance_before, balance_after, amount_brl, payment_method, channel, note, admin_id, created_at}
+  // "Ouro" — o inverso da loja de diamante (paga com diamante, recebe
+  // Royalle Coin). Mesma proporção de preço da referência do pppoker,
+  // só que a quantidade de Coin escalada pro tamanho da economia do
+  // Royalle (que começa em 50.000, não em milhões).
+  coinPackages: [
+    [5000, 60], [25000, 300], [60000, 680], [120000, 1208], [300000, 2980], [650000, 6380],
+  ].map(([coins, diamond_cost], i) => ({ id: i + 1, coins, diamond_cost, bonus_coins: 0, active: true, sort_order: i, created_at: new Date().toISOString(), updated_at: new Date().toISOString() })),
+  clubChipPackages: [
+    [50000, 100], [250000, 450], [600000, 1000], [1500000, 2400], [4000000, 6000],
+  ].map(([chips, diamond_cost], i) => ({ id: i + 1, chips, diamond_cost, bonus_chips: 0, active: true, sort_order: i, created_at: new Date().toISOString(), updated_at: new Date().toISOString() })),
+  clubChipTransactions: [], // {id, club_id, type, chips_delta, balance_before, balance_after, amount_brl, diamond_cost, payment_method, channel, note, buyer_user_id, admin_id, created_at}
   commercialConditions: [], // {id, club_id, model, platform_rake_percent, club_rake_percent, renewal_price_brl, renewal_periodicity_days, transfer_fee_percent, diamond_discount_percent, member_limit, table_limit, benefits, starts_at, ends_at, active, created_by, reason, created_at}
   clubLevelConfigs: [
     { level: 0, gestor_cap: 1, membro_cap: 10, price_diamonds: 0 },
@@ -64,8 +77,11 @@ const mem = {
   nextAgentMemberLinkId: 1,
   nextRakeEventId: 1,
   nextRakeClosingId: 1,
-  nextDiamondPackageId: 1,
+  nextDiamondPackageId: 7,
+  nextCoinPackageId: 7,
   nextDiamondTransactionId: 1,
+  nextClubChipPackageId: 6,
+  nextClubChipTransactionId: 1,
   nextCommercialConditionId: 1,
   nextAdminAuditLogId: 1,
 };
@@ -84,17 +100,53 @@ export async function getOrCreateQuickWallet(userId) {
   if (hasDatabase) {
     const { rows } = await pool.query(
       `INSERT INTO quick_wallets (user_id, chips) VALUES ($1, $2)
-       ON CONFLICT (user_id) DO NOTHING RETURNING chips, gems, last_daily_claim`,
+       ON CONFLICT (user_id) DO NOTHING RETURNING chips, gems, last_daily_claim, time_banks, rabbit_hunts`,
       [userId, QUICK_WALLET_START]
     );
-    if (rows[0]) return { chips: rows[0].chips, gems: Number(rows[0].gems), lastDailyClaim: rows[0].last_daily_claim };
-    const existing = await pool.query("SELECT chips, gems, last_daily_claim FROM quick_wallets WHERE user_id = $1", [userId]);
+    if (rows[0]) return { chips: rows[0].chips, gems: Number(rows[0].gems), lastDailyClaim: rows[0].last_daily_claim, timeBanks: rows[0].time_banks, rabbitHunts: rows[0].rabbit_hunts };
+    const existing = await pool.query("SELECT chips, gems, last_daily_claim, time_banks, rabbit_hunts FROM quick_wallets WHERE user_id = $1", [userId]);
     const r = existing.rows[0];
-    return r ? { chips: r.chips, gems: Number(r.gems), lastDailyClaim: r.last_daily_claim } : { chips: QUICK_WALLET_START, gems: 0, lastDailyClaim: null };
+    return r ? { chips: r.chips, gems: Number(r.gems), lastDailyClaim: r.last_daily_claim, timeBanks: r.time_banks, rabbitHunts: r.rabbit_hunts } : { chips: QUICK_WALLET_START, gems: 0, lastDailyClaim: null, timeBanks: 0, rabbitHunts: 0 };
   }
   let w = mem.quickWallets.find((w) => w.user_id === userId);
-  if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START, gems: 0, last_daily_claim: null }; mem.quickWallets.push(w); }
-  return { chips: w.chips, gems: w.gems || 0, lastDailyClaim: w.last_daily_claim };
+  if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START, gems: 0, time_banks: 0, rabbit_hunts: 0, last_daily_claim: null }; mem.quickWallets.push(w); }
+  return { chips: w.chips, gems: w.gems || 0, lastDailyClaim: w.last_daily_claim, timeBanks: w.time_banks || 0, rabbitHunts: w.rabbit_hunts || 0 };
+}
+
+// Saldo de Time Bank — pessoal do usuário, vale em qualquer mesa (cash
+// ou torneio), comprado na loja com diamante e gasto 1 por vez pra
+// ganhar +15s na própria vez de agir.
+export async function adjustQuickWalletTimeBanks(userId, delta) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO quick_wallets (user_id, time_banks) VALUES ($1, GREATEST($2, 0))
+       ON CONFLICT (user_id) DO UPDATE SET time_banks = GREATEST(quick_wallets.time_banks + $2, 0)
+       RETURNING time_banks`,
+      [userId, delta]
+    );
+    return rows[0].time_banks;
+  }
+  let w = mem.quickWallets.find((w) => w.user_id === userId);
+  if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START, gems: 0, time_banks: 0, rabbit_hunts: 0, last_daily_claim: null }; mem.quickWallets.push(w); }
+  w.time_banks = Math.max(0, (w.time_banks || 0) + delta);
+  return w.time_banks;
+}
+
+// Estoque de Caça ao Coelho — mesmo padrão do Time Bank.
+export async function adjustQuickWalletRabbitHunts(userId, delta) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO quick_wallets (user_id, rabbit_hunts) VALUES ($1, GREATEST($2, 0))
+       ON CONFLICT (user_id) DO UPDATE SET rabbit_hunts = GREATEST(quick_wallets.rabbit_hunts + $2, 0)
+       RETURNING rabbit_hunts`,
+      [userId, delta]
+    );
+    return rows[0].rabbit_hunts;
+  }
+  let w = mem.quickWallets.find((w) => w.user_id === userId);
+  if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START, gems: 0, time_banks: 0, rabbit_hunts: 0, last_daily_claim: null }; mem.quickWallets.push(w); }
+  w.rabbit_hunts = Math.max(0, (w.rabbit_hunts || 0) + delta);
+  return w.rabbit_hunts;
 }
 
 export async function adjustQuickWalletChips(userId, delta) {
@@ -1650,18 +1702,24 @@ export async function listAllUsersForMaster() {
   if (hasDatabase) {
     const { rows } = await pool.query(`
       SELECT u.id, u.username, u.avatar, u.platform_role, u.status, u.created_at, u.last_seen,
+        COALESCE(w.gems, 0) AS gems, COALESCE(w.chips, 0) AS quick_chips,
         (SELECT COUNT(*) FROM club_members cm WHERE cm.user_id = u.id) AS club_count,
         (SELECT COUNT(*) FROM clubs c WHERE c.owner_id = u.id) AS owned_club_count
-      FROM users u ORDER BY u.created_at DESC
+      FROM users u LEFT JOIN quick_wallets w ON w.user_id = u.id
+      ORDER BY u.created_at DESC
     `);
     return rows;
   }
-  return mem.users.map((u) => ({
-    id: u.id, username: u.username, avatar: u.avatar, platform_role: u.platform_role || null,
-    status: u.status || "active", created_at: u.created_at, last_seen: u.last_seen,
-    club_count: mem.members.filter((m) => m.user_id === u.id).length,
-    owned_club_count: mem.clubs.filter((c) => c.owner_id === u.id).length,
-  })).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  return mem.users.map((u) => {
+    const wallet = mem.quickWallets.find((w) => w.user_id === u.id);
+    return {
+      id: u.id, username: u.username, avatar: u.avatar, platform_role: u.platform_role || null,
+      status: u.status || "active", created_at: u.created_at, last_seen: u.last_seen,
+      gems: wallet?.gems || 0, quick_chips: wallet?.chips || 0,
+      club_count: mem.members.filter((m) => m.user_id === u.id).length,
+      owned_club_count: mem.clubs.filter((c) => c.owner_id === u.id).length,
+    };
+  }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 }
 
 export async function getUserForMasterDetail(userId) {
@@ -1694,6 +1752,47 @@ export async function setUserStatus(userId, status) {
 }
 
 // ---- pacotes de diamante ----
+
+// "Ouro" — comprar Royalle Coin pagando com diamante (mesmo padrão de
+// pacote configurável do diamante, só invertido).
+export async function listCoinPackages(onlyActive = false) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT * FROM coin_packages ${onlyActive ? "WHERE active = true" : ""} ORDER BY sort_order, id`
+    );
+    return rows;
+  }
+  return mem.coinPackages.filter((p) => !onlyActive || p.active).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+}
+
+export async function createCoinPackage({ coins, diamondCost, bonusCoins = 0, sortOrder = 0 }) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO coin_packages (coins, diamond_cost, bonus_coins, sort_order) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [coins, diamondCost, bonusCoins, sortOrder]
+    );
+    return rows[0];
+  }
+  const p = { id: mem.nextCoinPackageId++, coins, diamond_cost: diamondCost, bonus_coins: bonusCoins, active: true, sort_order: sortOrder, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  mem.coinPackages.push(p);
+  return p;
+}
+
+export async function updateCoinPackage(id, fields) {
+  const cols = Object.keys(fields);
+  if (cols.length === 0) return null;
+  const colMap = { coins: "coins", diamondCost: "diamond_cost", bonusCoins: "bonus_coins", active: "active", sortOrder: "sort_order" };
+  if (hasDatabase) {
+    const setSql = cols.map((k, i) => `${colMap[k] || k} = $${i + 2}`).join(", ") + ", updated_at = now()";
+    const { rows } = await pool.query(`UPDATE coin_packages SET ${setSql} WHERE id=$1 RETURNING *`, [id, ...cols.map((k) => fields[k])]);
+    return rows[0] || null;
+  }
+  const p = mem.coinPackages.find((p) => p.id === Number(id));
+  if (!p) return null;
+  cols.forEach((k) => { p[colMap[k] || k] = fields[k]; });
+  p.updated_at = new Date().toISOString();
+  return p;
+}
 
 export async function listDiamondPackages(onlyActive = false) {
   if (hasDatabase) {
@@ -1912,24 +2011,119 @@ export async function getPlatformFinancialSummary(from, to) {
        FROM diamond_transactions WHERE type = 'manual_sale' AND created_at BETWEEN $1 AND $2`,
       [from, to]
     );
+    const chipRows = await pool.query(
+      `SELECT COALESCE(SUM(amount_brl),0) AS revenue_brl, COALESCE(SUM(chips_delta),0) AS chips_sold, COUNT(*) AS transaction_count
+       FROM club_chip_transactions WHERE type = 'manual_sale' AND created_at BETWEEN $1 AND $2`,
+      [from, to]
+    );
     return {
       grossRake: Number(rows[0].gross_rake), rakebackTotal: Number(rows[0].rakeback_total),
       commissionTotal: Number(rows[0].commission_total), clubResultTotal: Number(rows[0].club_result_total),
       clubsWithActivity: Number(rows[0].clubs_with_activity),
       diamondRevenueBrl: Number(diamondRows.rows[0].revenue_brl), diamondsSold: Number(diamondRows.rows[0].diamonds_sold),
       diamondTransactionCount: Number(diamondRows.rows[0].transaction_count),
+      chipRevenueBrl: Number(chipRows.rows[0].revenue_brl), chipsSold: Number(chipRows.rows[0].chips_sold),
+      chipTransactionCount: Number(chipRows.rows[0].transaction_count),
     };
   }
   const events = mem.rakeEvents.filter((e) => inRange(e.created_at, from, to));
   const diamondSales = mem.diamondTransactions.filter((t) => t.type === "manual_sale" && inRange(t.created_at, from, to));
+  const chipSales = mem.clubChipTransactions.filter((t) => t.type === "manual_sale" && inRange(t.created_at, from, to));
   return {
     grossRake: events.reduce((s, e) => s + e.gross_amount, 0),
     rakebackTotal: events.reduce((s, e) => s + e.rakeback_amount, 0),
     commissionTotal: events.reduce((s, e) => s + e.commission_amount, 0),
     clubResultTotal: events.reduce((s, e) => s + e.club_result, 0),
     clubsWithActivity: new Set(events.map((e) => e.club_id)).size,
+    chipRevenueBrl: chipSales.reduce((s, t) => s + Number(t.amount_brl || 0), 0),
+    chipsSold: chipSales.reduce((s, t) => s + t.chips_delta, 0),
+    chipTransactionCount: chipSales.length,
     diamondRevenueBrl: diamondSales.reduce((s, t) => s + Number(t.amount_brl || 0), 0),
     diamondsSold: diamondSales.reduce((s, t) => s + t.diamonds_delta, 0),
     diamondTransactionCount: diamondSales.length,
   };
+}
+
+// ---- pacotes de ficha de clube (recarga da tesouraria, paga com diamante) ----
+
+export async function listClubChipPackages(onlyActive = false) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(`SELECT * FROM club_chip_packages ${onlyActive ? "WHERE active = true" : ""} ORDER BY sort_order, id`);
+    return rows;
+  }
+  return mem.clubChipPackages.filter((p) => !onlyActive || p.active).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+}
+
+export async function createClubChipPackage({ chips, diamondCost, bonusChips = 0, sortOrder = 0 }) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO club_chip_packages (chips, diamond_cost, bonus_chips, sort_order) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [chips, diamondCost, bonusChips, sortOrder]
+    );
+    return rows[0];
+  }
+  const p = { id: mem.nextClubChipPackageId++, chips, diamond_cost: diamondCost, bonus_chips: bonusChips, active: true, sort_order: sortOrder, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  mem.clubChipPackages.push(p);
+  return p;
+}
+
+export async function updateClubChipPackage(id, fields) {
+  const cols = Object.keys(fields);
+  if (cols.length === 0) return null;
+  const colMap = { chips: "chips", diamondCost: "diamond_cost", bonusChips: "bonus_chips", active: "active", sortOrder: "sort_order" };
+  if (hasDatabase) {
+    const setSql = cols.map((k, i) => `${colMap[k] || k} = $${i + 2}`).join(", ") + ", updated_at = now()";
+    const { rows } = await pool.query(`UPDATE club_chip_packages SET ${setSql} WHERE id=$1 RETURNING *`, [id, ...cols.map((k) => fields[k])]);
+    return rows[0] || null;
+  }
+  const p = mem.clubChipPackages.find((p) => p.id === Number(id));
+  if (!p) return null;
+  cols.forEach((k) => { p[colMap[k] || k] = fields[k]; });
+  p.updated_at = new Date().toISOString();
+  return p;
+}
+
+// Credita ficha na TESOURARIA do clube com ledger — mesmo princípio do
+// diamante, nunca só soma. Usado tanto pra compra dentro do app (dono
+// paga com diamante) quanto pra venda manual do Master (PIX/WhatsApp).
+export async function creditClubChipsWithLedger(clubId, delta, { type, amountBrl = null, diamondCost = null, paymentMethod = null, channel = null, note = null, buyerUserId = null, adminId = null }) {
+  const club = await getClubById(clubId);
+  const balanceBefore = Number(club.treasury_chips || 0);
+  const balanceAfter = await adjustClubTreasury(clubId, delta);
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `INSERT INTO club_chip_transactions (club_id, type, chips_delta, balance_before, balance_after, amount_brl, diamond_cost, payment_method, channel, note, buyer_user_id, admin_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [clubId, type, delta, balanceBefore, balanceAfter, amountBrl, diamondCost, paymentMethod, channel, note, buyerUserId, adminId]
+    );
+    return { transaction: rows[0], balanceAfter };
+  }
+  const tx = {
+    id: mem.nextClubChipTransactionId++, club_id: clubId, type, chips_delta: delta,
+    balance_before: balanceBefore, balance_after: balanceAfter, amount_brl: amountBrl, diamond_cost: diamondCost,
+    payment_method: paymentMethod, channel, note, buyer_user_id: buyerUserId, admin_id: adminId, created_at: new Date().toISOString(),
+  };
+  mem.clubChipTransactions.push(tx);
+  return { transaction: tx, balanceAfter };
+}
+
+export async function listClubChipTransactions({ clubId = null, limit = 100 } = {}) {
+  if (hasDatabase) {
+    const { rows } = await pool.query(
+      `SELECT ct.*, c.name AS club_name, a.username AS admin_username, b.username AS buyer_username FROM club_chip_transactions ct
+       JOIN clubs c ON c.id = ct.club_id LEFT JOIN users a ON a.id = ct.admin_id LEFT JOIN users b ON b.id = ct.buyer_user_id
+       ${clubId ? "WHERE ct.club_id = $2" : ""} ORDER BY ct.created_at DESC LIMIT $1`,
+      clubId ? [limit, clubId] : [limit]
+    );
+    return rows;
+  }
+  return mem.clubChipTransactions
+    .filter((t) => !clubId || t.club_id === Number(clubId))
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, limit)
+    .map((t) => ({
+      ...t, club_name: mem.clubs.find((c) => c.id === t.club_id)?.name,
+      admin_username: mem.users.find((u) => u.id === t.admin_id)?.username,
+      buyer_username: mem.users.find((u) => u.id === t.buyer_user_id)?.username,
+    }));
 }
