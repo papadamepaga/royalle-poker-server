@@ -703,6 +703,23 @@ export async function migrate() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  {
+    // Achado o bug real de por que "Ouro" nunca aparecia na loja: a
+    // tabela era criada certinha, mas ninguém nunca semeava as linhas
+    // iniciais (diferente de diamond_packages, que já tinha esse
+    // passo) — com banco Postgres de verdade ela ficava simplesmente
+    // vazia pra sempre.
+    const { rows } = await pool.query(`SELECT COUNT(*)::int AS n FROM coin_packages`);
+    if (rows[0].n === 0) {
+      const seed = [[5000, 60], [25000, 300], [60000, 680], [120000, 1208], [300000, 2980], [650000, 6380]];
+      for (let i = 0; i < seed.length; i++) {
+        await pool.query(
+          `INSERT INTO coin_packages (coins, diamond_cost, sort_order) VALUES ($1,$2,$3)`,
+          [seed[i][0], seed[i][1], i]
+        );
+      }
+    }
+  }
   // Time Bank — cada jogador tem um saldo próprio (compra na loja com
   // diamante), gasta 1 por vez pra ganhar +15s na própria vez de agir
   // em QUALQUER mesa (cash ou torneio) — por isso mora na carteira do
