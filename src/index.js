@@ -42,6 +42,75 @@ import { MAX_SEATS, makeBotId, pickBotName, pickBotAction } from "./bots.js";
 
 const PORT = process.env.PORT || 3001;
 const makeCode = customAlphabet("0123456789", 6);
+
+// ============================================================
+// TORNEIOS DA CASA (Royalle House) — os torneios públicos do Home
+// Game, sem dono de clube nenhum por trás. Reaproveita 100% do motor
+// de torneio que já existe (o mesmo dos clubes) — só cria um clube
+// "por baixo dos panos" (dono é uma conta de sistema, tesouraria
+// gigante pra nunca travar por causa da garantia) e usa ele como
+// club_id de todo torneio da casa.
+//
+// Agenda: 8h às 22h, de 2 em 2 horas (8 horários por dia), alternando
+// sempre nessa ordem: 10k/100k garantido, 20k/300k garantido, 50k/1M
+// garantido — e assim reinicia o ciclo. Cada horário é um torneio
+// RECORRENTE de verdade (mesmo mecanismo advanced_flags.recurring que
+// os clubes já usam) — uma vez criado, ele se recria sozinho no
+// próximo dia automaticamente (scheduleRecurringTournament), sem
+// precisar de nenhum código extra rodando.
+const HOUSE_CLUB_CODE = "888888";
+const HOUSE_OWNER_USERNAME = "RoyalleHouse";
+const HOUSE_TOURNAMENT_STAKES = [
+  { buyIn: 10000, gtd: 100000, label: "Royalle 10K" },
+  { buyIn: 20000, gtd: 300000, label: "Royalle 20K" },
+  { buyIn: 50000, gtd: 1000000, label: "Royalle 50K" },
+];
+const HOUSE_TOURNAMENT_HOURS = [8, 10, 12, 14, 16, 18, 20, 22];
+let houseClubId = null;
+
+async function ensureHouseClub() {
+  let owner = await findUserByUsername(HOUSE_OWNER_USERNAME);
+  if (!owner) {
+    // Senha aleatória, ninguém precisa logar com essa conta — ela só
+    // existe pra "ser dona" do clube da casa.
+    const passwordHash = await hashPassword(makeCode() + makeCode());
+    owner = await createUser(HOUSE_OWNER_USERNAME, passwordHash, "avatar_01");
+  }
+  let club = await getClubByCode(HOUSE_CLUB_CODE);
+  if (!club) {
+    club = await createClub({ code: HOUSE_CLUB_CODE, name: "Royalle House", ownerId: owner.id, smallBlind: 25, bigBlind: 50, buyIn: 5000, rakePercent: 0 });
+  }
+  houseClubId = club.id;
+  // Tesouraria bem grande, só pra nunca travar a checagem de "garantia
+  // não pode passar do saldo do clube" — o torneio da casa é bancado
+  // pela plataforma, não devia depender de buy-in cobrir a garantia.
+  const HOUSE_TREASURY_FLOOR = 50000000; // 50M
+  if (Number(club.treasury_chips) < HOUSE_TREASURY_FLOOR) {
+    await adjustClubTreasury(club.id, HOUSE_TREASURY_FLOOR - Number(club.treasury_chips));
+  }
+
+  // Semeia os 8 horários SÓ se ainda não existir nenhum torneio da casa
+  // — sem essa checagem, cada reinício do servidor criaria 8 novos.
+  const existing = await listClubTournaments(club.id);
+  if (existing.length > 0) return;
+  const now = new Date();
+  for (let i = 0; i < HOUSE_TOURNAMENT_HOURS.length; i++) {
+    const hour = HOUSE_TOURNAMENT_HOURS[i];
+    const stakes = HOUSE_TOURNAMENT_STAKES[i % HOUSE_TOURNAMENT_STAKES.length];
+    let start = new Date(now);
+    start.setHours(hour, 0, 0, 0);
+    if (start.getTime() < now.getTime()) start = new Date(start.getTime() + 86400000); // já passou hoje, começa amanhã
+    await createTournament({
+      clubId: club.id, name: `${stakes.label} — ${String(hour).padStart(2, "0")}h`, variant: "holdem",
+      buyIn: stakes.buyIn, startingChips: stakes.buyIn * 10, maxPlayers: 500, minPlayers: 2,
+      blindStructure: "standard", levelMinutes: 10, lateRegMinutes: 30, rebuyAllowed: false, rebuyMax: 0,
+      gtdPrize: stakes.gtd, startTime: start.toISOString(), createdBy: owner.id,
+      advancedFlags: { recurring: { enabled: true, days: [0, 1, 2, 3, 4, 5, 6] } },
+    });
+  }
+  console.log("Torneios da casa (Royalle House) semeados: 8 horários, 8h às 22h.");
+}
+
 const makeQuickCode = customAlphabet("0123456789", 8);
 
 // Mesas públicas de "Jogar" (fora de clube) — matchmaking automático por
@@ -2684,6 +2753,18 @@ async function handleMessage(ws, msg, ctx) {
     return;
   }
 
+  // Torneios da casa — lista pública, qualquer logado vê (não precisa
+  // ser membro de clube nenhum, é o mesmo espírito das mesas "Jogar
+  // contra bots"). Reaproveita listClubTournaments, só filtra pro clube
+  // da casa por dentro.
+  if (type === "list_house_tournaments") {
+    if (!requireAuth(ws, ctx)) return;
+    if (!houseClubId) return ctx.reply({ ok: true, tournaments: [] });
+    const tournaments = (await listClubTournaments(houseClubId)).filter((t) => t.status === "scheduled" || t.status === "running");
+    ctx.reply({ ok: true, tournaments });
+    return;
+  }
+
   if (type === "register_tournament") {
     if (!requireAuth(ws, ctx)) return;
     const t = await getTournamentById(Number(msg.tournamentId));
@@ -2740,7 +2821,22 @@ async function handleMessage(ws, msg, ctx) {
     const chargedBuyIn = earlyBirdActive
       ? Math.round(Number(t.buy_in) * (1 - Number(t.early_bird_discount_pct) / 100))
       : Number(t.buy_in);
-    const member = await getMember(t.club_id, ws.userId);
+    let member = await getMember(t.club_id, ws.userId);
+    // Torneio da casa: não existe "ser membro do clube" de verdade —
+    // todo mundo logado pode jogar. Garante a matrícula sozinho e
+    // cobre só a FALTA (nunca mexe em saldo que já tinha ali de algum
+    // torneio anterior) puxando do saldo de Royalle Coin da pessoa.
+    if (t.club_id === houseClubId) {
+      if (!member) { await addMember(t.club_id, ws.userId, 0, "member"); member = await getMember(t.club_id, ws.userId); }
+      const shortfall = chargedBuyIn - Number(member.chips);
+      if (shortfall > 0) {
+        const wallet = await getOrCreateQuickWallet(ws.userId);
+        if (wallet.chips < shortfall) return ctx.reply({ ok: false, error: "Royalle Coins insuficientes pra esse buy-in." });
+        await adjustQuickWalletChips(ws.userId, -shortfall);
+        await adjustMemberChips(t.club_id, ws.userId, shortfall);
+        member = await getMember(t.club_id, ws.userId);
+      }
+    }
     if (!member || Number(member.chips) < chargedBuyIn) return ctx.reply({ ok: false, error: "Saldo insuficiente pra esse buy-in." });
     // "Registro autorizado": em vez de sentar direto, entra numa fila
     // pro dono/gestor aprovar — não cobra nada até ser aprovado.
@@ -3863,6 +3959,7 @@ wss.on("connection", (ws, req) => {
 
 migrate()
   .then(() => reloadClubLevelTiers())
+  .then(() => ensureHouseClub())
   .then(() => {
     httpServer.listen(PORT, () => {
       console.log(`Royalle Poker server rodando na porta ${PORT}`);
