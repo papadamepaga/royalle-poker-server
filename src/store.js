@@ -133,6 +133,38 @@ export async function adjustQuickWalletTimeBanks(userId, delta) {
 }
 
 // Estoque de Caça ao Coelho — mesmo padrão do Time Bank.
+// Cartão VIP ativo (ou null se não tem/venceu). Comprar de novo o MESMO
+// cartão ainda ativo soma os dias em cima do vencimento atual.
+export async function getQuickWalletVip(userId) {
+  if (hasDatabase) {
+    const { rows } = await pool.query("SELECT vip_tier, vip_expires_at FROM quick_wallets WHERE user_id = $1", [userId]);
+    const r = rows[0];
+    if (!r || !r.vip_tier || !r.vip_expires_at || new Date(r.vip_expires_at) <= new Date()) return null;
+    return { tier: r.vip_tier, expiresAt: r.vip_expires_at };
+  }
+  const w = mem.quickWallets.find((w) => w.user_id === userId);
+  if (!w || !w.vip_tier || !w.vip_expires_at || new Date(w.vip_expires_at) <= new Date()) return null;
+  return { tier: w.vip_tier, expiresAt: w.vip_expires_at };
+}
+
+export async function setQuickWalletVip(userId, tier, days) {
+  const current = await getQuickWalletVip(userId);
+  const base = current && current.tier === tier ? new Date(current.expiresAt) : new Date();
+  const expiresAt = new Date(base.getTime() + days * 86400000).toISOString();
+  if (hasDatabase) {
+    await pool.query(
+      `INSERT INTO quick_wallets (user_id, vip_tier, vip_expires_at) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id) DO UPDATE SET vip_tier = $2, vip_expires_at = $3`,
+      [userId, tier, expiresAt]
+    );
+  } else {
+    let w = mem.quickWallets.find((w) => w.user_id === userId);
+    if (!w) { w = { user_id: userId, chips: QUICK_WALLET_START, gems: 0, time_banks: 0, rabbit_hunts: 0, last_daily_claim: null }; mem.quickWallets.push(w); }
+    w.vip_tier = tier; w.vip_expires_at = expiresAt;
+  }
+  return { tier, expiresAt };
+}
+
 export async function adjustQuickWalletRabbitHunts(userId, delta) {
   if (hasDatabase) {
     const { rows } = await pool.query(

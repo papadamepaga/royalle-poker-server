@@ -32,7 +32,7 @@ import {
   getUserPlatformRole, listAllClubsForMaster, getClubForMasterDetail, setClubStatus,
   listAllUsersForMaster, getUserForMasterDetail, setUserStatus,
   listDiamondPackages, createDiamondPackage, updateDiamondPackage, creditDiamondsWithLedger, listDiamondTransactions,
-  listCoinPackages, createCoinPackage, updateCoinPackage, adjustQuickWalletTimeBanks, adjustQuickWalletRabbitHunts,
+  listCoinPackages, createCoinPackage, updateCoinPackage, adjustQuickWalletTimeBanks, adjustQuickWalletRabbitHunts, getQuickWalletVip, setQuickWalletVip,
   getActiveCommercialCondition, listCommercialConditionHistory, setClubCommercialCondition,
   listClubLevelConfigs, setClubLevelConfig,
   recordAdminAuditLog, listAdminAuditLogs, getPlatformFinancialSummary,
@@ -1793,6 +1793,34 @@ async function handleMessage(ws, msg, ctx) {
   // compras igual tudo mais. O saldo mora na carteira do usuário (vale
   // em qualquer mesa); o USO de verdade (+15s na própria vez de agir)
   // é um handler à parte, mais abaixo, perto da ação de jogo.
+  // Cartões VIP — preço em diamante, 30 dias. Preços de Silver/Black
+  // seguem a referência do pppoker; Platinum foi definido por mim (não
+  // tinha referência) — ajustar aqui se quiser outro valor. Ainda sem
+  // benefícios amarrados ao VIP: por enquanto só registra o cartão ativo
+  // e o vencimento (pronto pra plugar benefícios depois).
+  const VIP_TIERS = {
+    vip_silver: { price: 380, days: 30, label: "VIP Silver" },
+    vip_black: { price: 1580, days: 30, label: "VIP Black" },
+    vip_platinum: { price: 3180, days: 30, label: "VIP Platinum" },
+  };
+  if (type === "list_vip_tiers") {
+    if (!requireAuth(ws, ctx)) return;
+    const tiers = Object.entries(VIP_TIERS).map(([id, t]) => ({ id, price: t.price, days: t.days }));
+    ctx.reply({ ok: true, tiers, vip: await getQuickWalletVip(ws.userId) });
+    return;
+  }
+  if (type === "buy_vip") {
+    if (!requireAuth(ws, ctx)) return;
+    const tier = VIP_TIERS[msg.itemId];
+    if (!tier) return ctx.reply({ ok: false, error: "Cartão não encontrado." });
+    const wallet = await getOrCreateQuickWallet(ws.userId);
+    if (wallet.gems < tier.price) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
+    const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -tier.price, { type: "buy_vip", note: `Comprou ${tier.label} (${tier.days} dias)`, channel: "app" });
+    const vip = await setQuickWalletVip(ws.userId, msg.itemId, tier.days);
+    ctx.reply({ ok: true, vip, gems: balanceAfter });
+    return;
+  }
+
   const TIME_BANK_DIAMOND_COST = 30;
   if (type === "buy_time_bank") {
     if (!requireAuth(ws, ctx)) return;
@@ -3341,6 +3369,23 @@ async function handleMessage(ws, msg, ctx) {
     await updateClubCoverImage(club.id, msg.image);
     ctx.reply({ ok: true });
     await broadcastClub(club.code);
+    return;
+  }
+
+  // Quantos jogadores DE VERDADE (sem contar bot) estão sentados nas mesas
+  // públicas, por tipo de jogo e por nível de blind — alimenta a tela de
+  // Home Game do lobby novo (o número embaixo de cada tipo de jogo).
+  if (type === "quick_players_online") {
+    if (!requireAuth(ws, ctx)) return;
+    const variants = {};
+    for (const v of Object.keys(QUICK_VARIANTS)) variants[v] = { total: 0, tiers: STAKES_TIERS.map(() => 0) };
+    for (const rt of runtime.values()) {
+      if (!rt.isQuick || !rt.table || !variants[rt.variant]) continue;
+      const humans = rt.table.players.filter((p) => !p.isBot && p.connected !== false).length;
+      variants[rt.variant].total += humans;
+      if (variants[rt.variant].tiers[rt.tierIndex] != null) variants[rt.variant].tiers[rt.tierIndex] += humans;
+    }
+    ctx.reply({ ok: true, variants });
     return;
   }
 

@@ -729,6 +729,9 @@ export async function migrate() {
   // loja com diamante, consome 1 cada vez que usa de verdade (em vez de
   // cobrar diamante na hora, no meio da mão).
   await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS rabbit_hunts INTEGER NOT NULL DEFAULT 0;`);
+  // Cartão VIP (Silver/Black/Platinum) — comprado com diamante, dura N dias.
+  await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS vip_tier TEXT;`);
+  await pool.query(`ALTER TABLE quick_wallets ADD COLUMN IF NOT EXISTS vip_expires_at TIMESTAMPTZ;`);
 
   console.log("Banco de dados migrado com sucesso.");
 }
