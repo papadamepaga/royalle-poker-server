@@ -3205,7 +3205,8 @@ async function handleMessage(ws, msg, ctx) {
     if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players, rakeCapBb: Number(t.rake_cap_bb ?? 3), actionSeconds: t.action_seconds || 30, revealFoldedCards: t.show_folded_cards !== false,
       seeInAction: !!t.see_in_action, straddleEnabled: !!(t.advanced_flags || {}).straddle, runItMultiple: !!(t.advanced_flags || {}).runItMultiple, splitEv: !!(t.advanced_flags || {}).splitEv });
     setupTableDuration(rt, t);;
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, (await getQuickWalletVip(ws.userId))?.tier || null);
+    { let vipTierAtSeat = null; try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
+      rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, vipTierAtSeat); }
     recordSessionBuyIn(rt.table, ws.username, buyIn);
     if (flags.gpsRestriction && msg.lat != null && msg.lng != null) {
       rt.seatedCoords = rt.seatedCoords || {};
@@ -3559,7 +3560,12 @@ async function handleMessage(ws, msg, ctx) {
     }
 
     await adjustQuickWalletChips(ws.userId, -buyIn);
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false, null, (await getQuickWalletVip(ws.userId))?.tier || null);
+    // Blindado com try/catch: se o banco ainda não tiver as colunas de
+    // VIP (backend antigo, sem redeploy), não pode travar a entrada na
+    // mesa inteira por causa de um badge cosmético — só entra sem selo.
+    let vipTierAtSeat = null;
+    try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, null, vipTierAtSeat);
     if (!found) fillWithBots(rt.table);
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
@@ -3590,7 +3596,8 @@ async function handleMessage(ws, msg, ctx) {
     if (wallet.chips < minBuyIn) return ctx.reply({ ok: false, error: "Royalle Coins insuficientes pra esse nível." });
     const buyIn = Math.min(maxBuyIn, Math.max(minBuyIn, Number(msg.buyIn) || minBuyIn), wallet.chips);
     await adjustQuickWalletChips(ws.userId, -buyIn);
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, (await getQuickWalletVip(ws.userId))?.tier || null);
+    { let vipTierAtSeat = null; try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
+      rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, vipTierAtSeat); }
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
