@@ -340,6 +340,23 @@ function publicTournament(t, entries, myEntry, myUsername) {
     myAddonUsed: myEntry ? !!myEntry.addon_used : false,
     myRebuys: myEntry ? Number(myEntry.rebuys || 0) : 0,
     estimatedPool, payoutTable, tables, myTableCode,
+    // HUD da mesa (pedido explícito, igual o pppoker mostra): blind
+    // atual/próximo (mesma fórmula de sempre, calculada aqui pra não
+    // duplicar no cliente) e minha posição no ranking de fichas entre
+    // quem ainda está jogando.
+    currentBlinds: tournamentBlindLevel(t, t.current_level),
+    nextBlinds: tournamentBlindLevel(t, (t.current_level || 0) + 1),
+    payoutSpots: payoutTable.length,
+    // Prévia da tabela de blinds (aba "Blinds" da tela cheia) — do nível
+    // atual até 11 à frente, é o suficiente pra pessoa se planejar sem
+    // precisar mandar uma tabela infinita.
+    blindLevels: Array.from({ length: 12 }, (_, i) => ({ level: (t.current_level || 0) + i, ...tournamentBlindLevel(t, (t.current_level || 0) + i) })),
+    myPosition: (() => {
+      if (!myEntry || myEntry.status !== "playing") return null;
+      const playing = active.filter((e) => e.status === "playing").sort((a, b) => Number(b.chips) - Number(a.chips));
+      const idx = playing.findIndex((e) => e.user_id === myEntry.user_id);
+      return idx === -1 ? null : idx + 1;
+    })(),
   };
 }
 
@@ -1798,10 +1815,14 @@ async function handleMessage(ws, msg, ctx) {
     if (!pkg) return ctx.reply({ ok: false, error: "Pacote não encontrado." });
     const wallet = await getOrCreateQuickWallet(ws.userId);
     if (wallet.chips < pkg.coin_cost) return ctx.reply({ ok: false, error: "Royalle Coin insuficiente." });
-    await adjustQuickWalletChips(ws.userId, -pkg.coin_cost);
+    const newChips = await adjustQuickWalletChips(ws.userId, -pkg.coin_cost);
     const totalDiamonds = pkg.diamonds + Number(pkg.bonus_diamonds || 0);
     const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, totalDiamonds, { type: "app_purchase", channel: "app" });
-    ctx.reply({ ok: true, diamonds: totalDiamonds, gems: balanceAfter, coinsSpent: pkg.coin_cost, coins: wallet.chips - pkg.coin_cost });
+    // Antes calculava "coins" na mão (wallet.chips - pkg.coin_cost, com o
+    // saldo de ANTES da compra) em vez de usar o valor real que
+    // adjustQuickWalletChips devolveu — nunca vi isso dar número errado
+    // sozinho, mas troquei pelo valor de verdade do banco por segurança.
+    ctx.reply({ ok: true, diamonds: totalDiamonds, gems: balanceAfter, coinsSpent: pkg.coin_cost, coins: newChips });
     return;
   }
 
@@ -1886,7 +1907,11 @@ async function handleMessage(ws, msg, ctx) {
     if (wallet.gems < tier.price) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
     const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -tier.price, { type: "buy_vip", note: `Comprou ${tier.label} (${tier.days} dias)`, channel: "app" });
     const vip = await setQuickWalletVip(ws.userId, msg.itemId, tier.days);
-    ctx.reply({ ok: true, vip, gems: balanceAfter });
+    // O front (ShopModal.onBought) sempre espera "chips" E "gems" juntos
+    // pra atualizar o saldo mostrado na tela — mandar só um dos dois
+    // zerava o outro na tela (era exatamente isso que tava fazendo o
+    // saldo de fichas "sumir" depois de comprar VIP/Time Bank/Coelho).
+    ctx.reply({ ok: true, vip, gems: balanceAfter, chips: wallet.chips });
     return;
   }
 
@@ -1899,7 +1924,7 @@ async function handleMessage(ws, msg, ctx) {
     if (wallet.gems < cost) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
     const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -cost, { type: "buy_timebank", note: `Comprou ${qty} Time Bank`, channel: "app" });
     const timeBanks = await adjustQuickWalletTimeBanks(ws.userId, qty);
-    ctx.reply({ ok: true, timeBanks, gems: balanceAfter });
+    ctx.reply({ ok: true, timeBanks, gems: balanceAfter, chips: wallet.chips });
     return;
   }
 
@@ -3180,7 +3205,7 @@ async function handleMessage(ws, msg, ctx) {
     if (!rt.table) rt.table = new PokerTable({ smallBlind: t.small_blind, bigBlind: t.big_blind, rakePercent: Number(t.rake_percent), variant: t.variant, maxSeats: t.max_players, rakeCapBb: Number(t.rake_cap_bb ?? 3), actionSeconds: t.action_seconds || 30, revealFoldedCards: t.show_folded_cards !== false,
       seeInAction: !!t.see_in_action, straddleEnabled: !!(t.advanced_flags || {}).straddle, runItMultiple: !!(t.advanced_flags || {}).runItMultiple, splitEv: !!(t.advanced_flags || {}).splitEv });
     setupTableDuration(rt, t);;
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, (await getQuickWalletVip(ws.userId))?.tier || null);
     recordSessionBuyIn(rt.table, ws.username, buyIn);
     if (flags.gpsRestriction && msg.lat != null && msg.lng != null) {
       rt.seatedCoords = rt.seatedCoords || {};
@@ -3495,6 +3520,27 @@ async function handleMessage(ws, msg, ctx) {
     const tier = STAKES_TIERS[tierIndex];
     if (!tier) return ctx.reply({ ok: false, error: "Nível de blind inválido." });
 
+    // Achado o bug real de "não consegui sentar": se a pessoa JÁ está
+    // sentada numa mesa rápida dessa variante+nível (sessão anterior
+    // que não saiu direito, ou clicou de novo sem perceber), addPlayer
+    // silenciosamente não faz nada quando o id já existe na mesa — mas
+    // o find_table continuava descontando o buy-in do saldo mesmo
+    // assim e respondia "ok"! A pessoa perdia Royalle Coin sem ganhar
+    // ficha nenhuma na mesa. Antes de cobrar qualquer coisa, procura em
+    // TODA mesa rápida dessa variante+nível se ela já está sentada — se
+    // estiver, só reconecta ali, sem cobrar de novo.
+    for (const [existingCode, existingRt] of runtime.entries()) {
+      if (!existingRt.isQuick || existingRt.variant !== variant || existingRt.tierIndex !== tierIndex || !existingRt.table) continue;
+      if (existingRt.table.players.some((p) => p.id === ws.username)) {
+        existingRt.sockets.add(ws);
+        existingRt.socketToPlayer.set(ws, ws.username);
+        ctx.setJoinedCode(existingCode);
+        ctx.reply({ ok: true, code: existingCode, variant });
+        broadcastTable(existingCode);
+        return;
+      }
+    }
+
     const wallet = await getOrCreateQuickWallet(ws.userId);
     const minBuyIn = tier.buyIn;
     const maxBuyIn = tier.buyIn * 4; // convenção comum de mesa de cash: até 4x o buy-in mínimo
@@ -3513,7 +3559,7 @@ async function handleMessage(ws, msg, ctx) {
     }
 
     await adjustQuickWalletChips(ws.userId, -buyIn);
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false);
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, null, (await getQuickWalletVip(ws.userId))?.tier || null);
     if (!found) fillWithBots(rt.table);
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
@@ -3544,7 +3590,7 @@ async function handleMessage(ws, msg, ctx) {
     if (wallet.chips < minBuyIn) return ctx.reply({ ok: false, error: "Royalle Coins insuficientes pra esse nível." });
     const buyIn = Math.min(maxBuyIn, Math.max(minBuyIn, Number(msg.buyIn) || minBuyIn), wallet.chips);
     await adjustQuickWalletChips(ws.userId, -buyIn);
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null);
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, (await getQuickWalletVip(ws.userId))?.tier || null);
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
@@ -3611,7 +3657,7 @@ async function handleMessage(ws, msg, ctx) {
     if (wallet.gems < cost) return ctx.reply({ ok: false, error: "Diamantes insuficientes." });
     const { balanceAfter } = await creditDiamondsWithLedger(ws.userId, -cost, { type: "buy_rabbithunt", note: `Comprou ${qty} Caça ao Coelho`, channel: "app" });
     const rabbitHunts = await adjustQuickWalletRabbitHunts(ws.userId, qty);
-    ctx.reply({ ok: true, rabbitHunts, gems: balanceAfter });
+    ctx.reply({ ok: true, rabbitHunts, gems: balanceAfter, chips: wallet.chips });
     return;
   }
 
