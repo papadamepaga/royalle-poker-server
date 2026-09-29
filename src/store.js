@@ -184,8 +184,16 @@ export async function adjustQuickWalletRabbitHunts(userId, delta) {
 export async function adjustQuickWalletChips(userId, delta) {
   if (hasDatabase) {
     const { rows } = await pool.query(
-      `INSERT INTO quick_wallets (user_id, chips) VALUES ($1, GREATEST($2 + $3, 0))
-       ON CONFLICT (user_id) DO UPDATE SET chips = GREATEST(quick_wallets.chips + $3, 0)
+      // Achado o bug real do "Erro interno no servidor" ao sentar: o
+      // Postgres não consegue decidir sozinho o tipo de "$2 + $3"
+      // quando os dois lados são parâmetros crus (nenhum é uma coluna
+      // com tipo já conhecido) — dá exatamente "operator is not
+      // unique: unknown + unknown". O CONFLICT nunca acontecia até
+      // agora nos meus testes porque eu sempre rodava em modo memória
+      // (sem Postgres de verdade), que não passa pelo SQL. Corrigido
+      // fixando o tipo dos dois parâmetros com ::bigint.
+      `INSERT INTO quick_wallets (user_id, chips) VALUES ($1, GREATEST($2::bigint + $3::bigint, 0))
+       ON CONFLICT (user_id) DO UPDATE SET chips = GREATEST(quick_wallets.chips + $3::bigint, 0)
        RETURNING chips`,
       [userId, QUICK_WALLET_START, delta]
     );
