@@ -484,7 +484,7 @@ export class PokerTable {
     if (this.log.length > 30) this.log.shift();
   }
 
-  addPlayer(id, name, chips, isBot = false, seat = null, vipTier = null) {
+  addPlayer(id, name, chips, isBot = false, seat = null, vipTier = null, avatar = null) {
     if (this.players.find((p) => p.id === id)) return;
     const taken = new Set(this.players.map((p) => p.seat));
     let seatIndex = Number.isInteger(seat) && seat >= 0 && seat < this.maxSeats && !taken.has(seat) ? seat : null;
@@ -494,7 +494,7 @@ export class PokerTable {
       for (let i = 0; i < this.maxSeats; i++) { if (!taken.has(i)) { seatIndex = i; break; } }
       if (seatIndex === null) return; // mesa cheia
     }
-    const player = { id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot, away: false, seat: seatIndex, vipTier: vipTier || null };
+    const player = { id, name, chips, cards: [], folded: false, allIn: false, inHand: false, roundBet: 0, totalBet: 0, connected: true, isBot, away: false, seat: seatIndex, vipTier: vipTier || null, avatar: avatar || null };
     // Mantém this.players sempre ordenado por assento físico — o resto
     // da engine (ordem de ação, rotação do dealer) caminha por esse
     // array em sequência assumindo que ele já representa a ordem física
@@ -1327,6 +1327,11 @@ export class PokerTable {
           // sessão na mesa; se comprar/trocar de cartão DEPOIS de já
           // sentado, só reflete na próxima vez que sentar numa mesa.
           vipTier: p.vipTier || null,
+          // Achado o motivo real da foto não aparecer na mesa: o
+          // SeatAvatar sempre foi só um ícone genérico, nunca recebia
+          // avatar nenhum — nem o motor guardava isso por jogador. Pego
+          // uma vez ao sentar (ver addPlayer), igual o cartão VIP.
+          avatar: p.avatar || null,
         };
       }),
     };

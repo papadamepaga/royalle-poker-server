@@ -89,10 +89,15 @@ async function ensureHouseClub() {
     await adjustClubTreasury(club.id, HOUSE_TREASURY_FLOOR - Number(club.treasury_chips));
   }
 
-  // Semeia os 8 horários SÓ se ainda não existir nenhum torneio da casa
-  // — sem essa checagem, cada reinício do servidor criaria 8 novos.
+  // Semeia os 8 horários só se não sobrar nenhum agendado/em andamento
+  // — olha por STATUS (não só "existe alguma linha"), porque antes
+  // dessa correção todo mundo podia ter cancelado por falta de gente e
+  // nunca mais recriava (é o mesmo bug de cima); assim, se isso já
+  // aconteceu antes do deploy dessa correção, o servidor se recupera
+  // sozinho no próximo restart em vez de ficar sem torneio nenhum pra
+  // sempre.
   const existing = await listClubTournaments(club.id);
-  if (existing.length > 0) return;
+  if (existing.some((t) => t.status === "scheduled" || t.status === "running")) return;
   const now = new Date();
   for (let i = 0; i < HOUSE_TOURNAMENT_HOURS.length; i++) {
     const hour = HOUSE_TOURNAMENT_HOURS[i];
@@ -455,6 +460,14 @@ async function startTournament(t) {
       await updateTournamentEntry(t.id, e.user_id, { status: "cancelled" });
     }
     await updateTournament(t.id, { status: "cancelled" });
+    // Achado o bug real de "os torneios sumiram": um torneio recorrente
+    // só religava o próximo dia quando TERMINAVA de verdade
+    // (finishTournament). Cancelado por falta de gente nunca passava
+    // por ali — a cadeia parava pra sempre no primeiro horário sem 2
+    // inscritos. Pros torneios da casa isso não pode acontecer (são
+    // agendados o dia inteiro, é esperado que alguns horários fiquem
+    // vazios) — religa mesmo assim.
+    if (t.club_id === houseClubId) await scheduleRecurringTournament(t);
     return;
   }
   // O torneio (tabela `tournaments`) só guarda club_id, não o código do
@@ -1060,7 +1073,13 @@ function broadcastTable(code) {
   const table = rt?.table;
   if (!table) return;
   for (const [ws, username] of rt.socketToPlayer.entries()) {
-    send(ws, { type: "table_state", state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0), autoStart: rt.autoStart !== false, minStartPlayers: rt.minStartPlayers || 2, chatBanned: !!rt.chatBanned } });
+    // Achado o bug real do "flip-flop" entre duas mesas abertas ao
+    // mesmo tempo: essa mensagem nunca dizia DE QUAL mesa ela era — o
+    // cliente só tinha um estado de "mesa atual" e aplicava cegamente
+    // qualquer table_state que chegasse, mesmo vindo de uma mesa
+    // diferente da que a pessoa estava olhando. Manda o código junto
+    // pra quem recebe poder filtrar.
+    send(ws, { type: "table_state", code, state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0), autoStart: rt.autoStart !== false, minStartPlayers: rt.minStartPlayers || 2, chatBanned: !!rt.chatBanned } });
   }
   maybeRecordRake(rt, code);
   maybeAwardJackpot(rt, code);
@@ -3206,7 +3225,8 @@ async function handleMessage(ws, msg, ctx) {
       seeInAction: !!t.see_in_action, straddleEnabled: !!(t.advanced_flags || {}).straddle, runItMultiple: !!(t.advanced_flags || {}).runItMultiple, splitEv: !!(t.advanced_flags || {}).splitEv });
     setupTableDuration(rt, t);;
     { let vipTierAtSeat = null; try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
-      rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, vipTierAtSeat); }
+      let avatarAtSeat = null; try { avatarAtSeat = (await findUserById(ws.userId))?.avatar || null; } catch { avatarAtSeat = null; }
+      rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, vipTierAtSeat, avatarAtSeat); }
     recordSessionBuyIn(rt.table, ws.username, buyIn);
     if (flags.gpsRestriction && msg.lat != null && msg.lng != null) {
       rt.seatedCoords = rt.seatedCoords || {};
@@ -3264,7 +3284,9 @@ async function handleMessage(ws, msg, ctx) {
     setupTableDuration(rt, t);;
     }
     if (rt.table) {
-      rt.table.addPlayer(req.username, req.username, req.buyIn, false, req.seat);
+      const reqUser = await findUserByUsername(req.username);
+      let vipTierAtSeat = null; try { if (reqUser) vipTierAtSeat = (await getQuickWalletVip(reqUser.id))?.tier || null; } catch { vipTierAtSeat = null; }
+      rt.table.addPlayer(req.username, req.username, req.buyIn, false, req.seat, vipTierAtSeat, reqUser?.avatar || null);
       recordSessionBuyIn(rt.table, req.username, req.buyIn);
     }
     pushToUser(req.username, { type: "buyin_approved", code });
@@ -3282,7 +3304,9 @@ async function handleMessage(ws, msg, ctx) {
     await adjustMemberChips(club.id, ws.userId, -msg.buyIn);
     const rt = ensureRuntime(club.code, club.id);
     if (!rt.table) rt.table = new PokerTable({ smallBlind: club.small_blind, bigBlind: club.big_blind, rakePercent: Number(club.rake_percent) });
-    rt.table.addPlayer(ws.username, ws.username, msg.buyIn);
+    { let vipTierAtSeat = null; try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
+      let avatarAtSeat = null; try { avatarAtSeat = (await findUserById(ws.userId))?.avatar || null; } catch { avatarAtSeat = null; }
+      rt.table.addPlayer(ws.username, ws.username, msg.buyIn, false, null, vipTierAtSeat, avatarAtSeat); }
     recordSessionBuyIn(rt.table, ws.username, msg.buyIn);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.reply({ ok: true });
@@ -3565,7 +3589,9 @@ async function handleMessage(ws, msg, ctx) {
     // mesa inteira por causa de um badge cosmético — só entra sem selo.
     let vipTierAtSeat = null;
     try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
-    rt.table.addPlayer(ws.username, ws.username, buyIn, false, null, vipTierAtSeat);
+    let avatarAtSeat = null;
+    try { avatarAtSeat = (await findUserById(ws.userId))?.avatar || null; } catch { avatarAtSeat = null; }
+    rt.table.addPlayer(ws.username, ws.username, buyIn, false, null, vipTierAtSeat, avatarAtSeat);
     if (!found) fillWithBots(rt.table);
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
@@ -3597,7 +3623,8 @@ async function handleMessage(ws, msg, ctx) {
     const buyIn = Math.min(maxBuyIn, Math.max(minBuyIn, Number(msg.buyIn) || minBuyIn), wallet.chips);
     await adjustQuickWalletChips(ws.userId, -buyIn);
     { let vipTierAtSeat = null; try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
-      rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, vipTierAtSeat); }
+      let avatarAtSeat = null; try { avatarAtSeat = (await findUserById(ws.userId))?.avatar || null; } catch { avatarAtSeat = null; }
+      rt.table.addPlayer(ws.username, ws.username, buyIn, false, Number.isInteger(msg.seat) ? msg.seat : null, vipTierAtSeat, avatarAtSeat); }
     rt.sockets.add(ws);
     rt.socketToPlayer.set(ws, ws.username);
     ctx.setJoinedCode(code);
@@ -3760,7 +3787,9 @@ async function handleMessage(ws, msg, ctx) {
     // pulseTournamentTable já tirou esse jogador de rt.table.players
     // quando ele zerou — precisa sentar ele de novo, com a pilha nova.
     if (!rt.table.players.some((p) => p.id === username)) {
-      rt.table.addPlayer(username, username, chipsGranted, false);
+      let vipTierAtSeat = null; try { vipTierAtSeat = (await getQuickWalletVip(ws.userId))?.tier || null; } catch { vipTierAtSeat = null; }
+      let avatarAtSeat = null; try { avatarAtSeat = (await findUserById(ws.userId))?.avatar || null; } catch { avatarAtSeat = null; }
+      rt.table.addPlayer(username, username, chipsGranted, false, null, vipTierAtSeat, avatarAtSeat);
     }
     recordSessionBuyIn(rt.table, username, price);
     ctx.reply({ ok: true, chips: chipsGranted, code });
