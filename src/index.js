@@ -793,17 +793,20 @@ function tickActionTimeouts() {
     if (!table || !table.actingId) continue;
     const p = table.players.find((pl) => pl.id === table.actingId);
     if (!p || p.isBot) continue; // bots já têm o próprio relógio (pulseQuickTable)
-    if (table.actingId !== rt._lastActingId) {
-      rt._lastActingId = table.actingId;
-      rt._actingSince = now;
-      continue;
-    }
-    const timeoutMs = (Number(table.actionSeconds) || 30) * 1000 + ACTION_GRACE_MS;
+    // _actingSince agora é mantido pelo broadcastTable (sempre que
+    // actingId muda, em QUALQUER chamada, não só nesse tick de 1s) —
+    // mais preciso, e os dois lugares usam o mesmo valor em vez de
+    // duas contagens separadas que podiam divergir.
+    if (table.actingId !== rt._lastActingId) { rt._lastActingId = table.actingId; rt._actingSince = now; continue; }
+    // Quem já está marcado "ausente" (de um timeout anterior, ainda
+    // não apertou "Estou de volta") não precisa esperar o tempo
+    // normal de novo — já sabemos que não vai responder. Passa rápido
+    // (2s) em vez de segurar a mesa inteira esperando os 30+10s de
+    // sempre a cada mão.
+    const timeoutMs = p.away ? 2000 : (Number(table.actionSeconds) || 30) * 1000 + ACTION_GRACE_MS;
     if (now - (rt._actingSince || now) >= timeoutMs) {
       table.autoTimeoutAction(table.actingId);
-      rt._lastActingId = table.actingId; // pode já ser o próximo jogador
-      rt._actingSince = now;
-      broadcastTable(code);
+      broadcastTable(code); // já atualiza _lastActingId/_actingSince se a vez passou pra outro alguém
     }
   }
 }
@@ -1072,6 +1075,22 @@ function broadcastTable(code) {
   const rt = runtime.get(code);
   const table = rt?.table;
   if (!table) return;
+  // Achado o bug real do item 3 ("a ação passa rápido e me folda sem
+  // meu tempo acabar"): o cronômetro visual do cliente sempre
+  // começava do zero (30s cheios) toda vez que a TELA via um novo
+  // actingId — mas se a pessoa tava olhando OUTRA mesa quando a vez
+  // dela chegou aqui (com 2 mesas abertas, muito comum), o relógio de
+  // verdade do servidor já tava rodando havia um tempo. Ao voltar pra
+  // essa mesa, o cliente mostrava 30s cheios de novo, mesmo faltando
+  // só alguns segundos de verdade — daí "o tempo acaba" sem aviso.
+  // Agora manda o instante real em que a vez começou (calculado aqui,
+  // sempre que actingId muda — mais preciso que o tick de 1 em 1s que
+  // já existia só pra aplicar o timeout) pro cliente calcular o tempo
+  // restante de verdade, não um cronômetro que reseta sozinho.
+  if (table.actingId !== rt._lastActingId) {
+    rt._lastActingId = table.actingId;
+    rt._actingSince = Date.now();
+  }
   for (const [ws, username] of rt.socketToPlayer.entries()) {
     // Achado o bug real do "flip-flop" entre duas mesas abertas ao
     // mesmo tempo: essa mensagem nunca dizia DE QUAL mesa ela era — o
@@ -1079,7 +1098,7 @@ function broadcastTable(code) {
     // qualquer table_state que chegasse, mesmo vindo de uma mesa
     // diferente da que a pessoa estava olhando. Manda o código junto
     // pra quem recebe poder filtrar.
-    send(ws, { type: "table_state", code, state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0), autoStart: rt.autoStart !== false, minStartPlayers: rt.minStartPlayers || 2, chatBanned: !!rt.chatBanned } });
+    send(ws, { type: "table_state", code, state: { ...table.getPublicState(username), tableName: rt.tableName || null, tableId: rt.tableId ?? null, jackpotEnabled: !!rt.jackpotEnabled, jackpotBalance: Number(rt.jackpotBalance || 0), autoStart: rt.autoStart !== false, minStartPlayers: rt.minStartPlayers || 2, chatBanned: !!rt.chatBanned, actingSince: table.actingId ? rt._actingSince : null } });
   }
   maybeRecordRake(rt, code);
   maybeAwardJackpot(rt, code);
@@ -3327,7 +3346,13 @@ async function handleMessage(ws, msg, ctx) {
     if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
     const player = rt.table.players.find((p) => p.id === ws.username);
     if (!player) return ctx.reply({ ok: false, error: "Você não está sentado nessa mesa." });
-    if (rt.table.stage !== "idle" && rt.table.stage !== "showdown") {
+    // Achado o bug real do item 1: travava o pedido de recompra até a
+    // mão TERMINAR pra mesa inteira — mas quem zerou as fichas já não
+    // está mais em jogo nessa mão nenhum jeito (não tem como apostar
+    // mais do que tem). Deixa pedir assim que zerar; as fichas entram
+    // na hora, só não valem pra mão atual porque o motor só confere o
+    // stack de quem ainda está jogando nela — na próxima mão já conta.
+    if (rt.table.stage !== "idle" && rt.table.stage !== "showdown" && player.chips > 0) {
       return ctx.reply({ ok: false, error: "Só dá pra recomprar fora de uma mão em andamento." });
     }
     const amount = Math.floor(Number(msg.amount) || 0);
@@ -3850,6 +3875,25 @@ async function handleMessage(ws, msg, ctx) {
     const p = rt.table.players.find((pl) => pl.id === ws.username);
     if (p) p.chips = Number(p.chips || 0) + chipsGranted;
     ctx.reply({ ok: true, chips: Number(entry.chips || 0) + chipsGranted, code });
+    broadcastTable(code);
+    return;
+  }
+
+  // "Estou de volta" — item 2: antes, uma vez marcado "ausente" (depois
+  // de estourar o tempo sem agir), só saía desse estado agindo de novo
+  // na mesa — ou seja, a pessoa continuava sendo sentada em toda mão
+  // nova e, sem perceber que precisava agir, levava outro timeout, e
+  // outro, silenciosamente. Agora tem um botão explícito: só volta a
+  // ser tratado como "presente" quando aperta ele.
+  if (type === "return_from_away") {
+    if (!requireAuth(ws, ctx)) return;
+    const code = (msg.code || "").toUpperCase();
+    const rt = runtime.get(code);
+    if (!rt?.table) return ctx.reply({ ok: false, error: "Mesa não encontrada." });
+    const p = rt.table.players.find((pl) => pl.id === ws.username);
+    if (!p) return ctx.reply({ ok: false, error: "Você não está sentado nessa mesa." });
+    p.away = false;
+    ctx.reply({ ok: true });
     broadcastTable(code);
     return;
   }

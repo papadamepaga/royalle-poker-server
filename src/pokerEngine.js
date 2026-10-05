@@ -713,12 +713,15 @@ export class PokerTable {
     const p = this.players.find((pl) => pl.id === playerId);
     if (!p || this.actingId !== playerId) return;
     const toCall = this.currentBet - p.roundBet;
-    if (toCall > 0) {
-      this.applyAction(playerId, "fold");
-      p.away = true; // aplica DEPOIS — applyAction sempre zera away no início
-    } else {
-      this.applyAction(playerId, "check");
-    }
+    // Achado o bug real do item 2: quando dava pra passar de graça
+    // (toCall===0), o jogador ficava marcado como "voltou" mesmo sem
+    // ter apertado nada — applyAction sempre zera away no início e
+    // ninguém marcava true de novo nesse ramo. Agora marca ausente nos
+    // dois casos (fold OU check automático) — só sai desse estado
+    // apertando "Estou de volta" de propósito.
+    if (toCall > 0) this.applyAction(playerId, "fold");
+    else this.applyAction(playerId, "check");
+    p.away = true; // aplica DEPOIS — applyAction sempre zera away no início
   }
 
   // Devolve a parte de uma aposta/all-in que NINGUÉM mais tinha ficha
